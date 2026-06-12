@@ -2,6 +2,16 @@
  * HS Code 유권해석(Ruling) 주간 모니터링 시스템
  * ─────────────────────────────────────────────
  * [변경 이력]
+ * v3.1
+ *  - 디자인 리뉴얼 (레퍼런스 테마 적용):
+ *      · 글로벌 테마 상수 도입 (FONT_STACK / CATEGORY_COLORS / IMPORTANCE_COLORS / IMPORTANCE_BG)
+ *      · 이메일: 플랫 레이아웃(#eef1f5 배경, 680px, #dde1e7 보더), 네이비 헤더/푸터(#14294a, bgcolor 병기로 Outlook 호환),
+ *        수록 기준 안내 영역(연초록 #eaf6ee + #2e8b57 상단 보더), 카테고리 섹션 헤더 솔리드 컬러
+ *      · 아이템 카드: 좌측 5px 중요도 세로 컬러바, 공통 뱃지 UI(중요도/HS/기업), 타이틀 원문 링크(#15418c 언더라인)
+ *      · 구글 시트: 헤더 네이비(#1a2a4a), 중요도 '상' 행 연한 빨강(#fff5f5) 하이라이트
+ *  - importance(중요도 상/중/하) 필드 추가: Gemini가 판정(상=모니터링 기업 직접 관련/핵심 품목 분류 변경·분쟁,
+ *    중=모니터링 품목, 하=HS류만 관련), 국가별 카드 상→중→하 정렬, 시트 '중요도' 컬럼 저장
+ *
  * v3.0
  *  - [버그] 동북아(한국/일본) 카테고리가 이메일 CATEGORY_ORDER에 없어 메일에서 누락되던 문제 수정
  *  - [버그] 지역 프롬프트에 "last 30 days"가 하드코딩되어 MONITORING_DAYS(14일)와 모순되던 문제 수정
@@ -49,6 +59,25 @@ var URL_VERIFY_MAX = 25;
 
 // Gmail 폴링용 라벨 (처리 완료 메일 마킹 — 없으면 자동 생성)
 var PROCESSED_LABEL = 'HS-요청-처리완료';
+
+// ─── 디자인 테마 상수 ────────────────────────────────────────────────────────
+
+var FONT_STACK = "'Malgun Gothic','맑은 고딕','Apple SD Gothic Neo',Arial,sans-serif";
+
+// 카테고리별 테마 컬러 (이메일 섹션 헤더/뱃지) — MONITORING_REGIONS의 category와 일치해야 함
+var CATEGORY_COLORS = {
+  '동북아': '#14294a', '중국': '#990000', '북미': '#1a3c5e', '중남미': '#1b5e3b',
+  '인도': '#7b3000', '유럽': '#003080', '중동': '#6d3b00', '동남아': '#00565a',
+  '아프리카': '#4a2800', 'CIS': '#3a1a5a', '글로벌': '#37474f'
+};
+
+// 중요도별 뱃지/컬러바 색상
+var IMPORTANCE_COLORS = { '상': '#c62828', '중': '#ef6c00', '하': '#2e7d32' };
+var IMPORTANCE_BG     = { '상': '#fdecea', '중': '#fff3e0', '하': '#e8f5e9' };
+
+// 구글 시트 스타일
+var SHEET_HEADER_BG    = '#1a2a4a';  // 헤더 네이비 딥블루
+var SHEET_HIGHLIGHT_BG = '#fff5f5';  // 중요도 '상' 행 하이라이트
 
 // ─── 모니터링 지역/사이트 구성 ───────────────────────────────────────────────
 // isGroup   : true → 묶음 호출. Gemini가 country 필드에 실제 국가명을 채움
@@ -380,14 +409,26 @@ var COUNTRY_SEARCH_LANG = {
  *  ④ 일반 구글 검색 (현지 언어 hl/gl) → "구글 검색"
  * 항상 ①or② 버튼 + ③ + ④ 순으로 최대 3개 버튼을 표시한다.
  */
+/** 수집 URL(검증 통과) 또는 공식 DB 직링크 중 가장 신뢰할 수 있는 원문 URL 반환 (없으면 '') */
+function _directOriginalUrl(item) {
+  var urlOk = item.url && /^https?:\/\//i.test(item.url) &&
+              String(item.url_status || '').indexOf('FAIL') === -1;
+  if (urlOk) return item.url;
+  var official = OFFICIAL_DB[item.country] || null;
+  if (official && official.rulingUrl && item.ruling_number) {
+    return official.rulingUrl.replace('{NUM}', encodeURIComponent(String(item.ruling_number).trim()));
+  }
+  return '';
+}
+
 function _buildSourceLink(item) {
   var buttons  = [];
   var official = OFFICIAL_DB[item.country] || null;
 
   function btn(url, label, color) {
     return '<a href="' + url + '" target="_blank" ' +
-           'style="color:' + color + ';text-decoration:none;font-size:12px;font-weight:bold;' +
-           'border:1px solid ' + color + ';padding:2px 10px;border-radius:4px;margin-right:6px;display:inline-block;margin-bottom:3px;">' +
+           'style="display:inline-block;color:' + color + ';text-decoration:none;font-size:11px;font-weight:bold;' +
+           'border:1px solid ' + color + ';padding:2px 8px;border-radius:3px;margin-right:6px;margin-bottom:3px;">' +
            label + '</a>';
   }
 
@@ -396,12 +437,12 @@ function _buildSourceLink(item) {
               String(item.url_status || '').indexOf('FAIL') === -1;
   if (urlOk) {
     var srcName = item.url_source ? ' (' + _escapeHtml(item.url_source) + ')' : '';
-    buttons.push(btn(_escapeHtml(item.url), '원문 보기' + srcName, '#b71c1c'));
+    buttons.push(btn(_escapeHtml(item.url), '원문 보기' + srcName, '#c62828'));
   }
-  // ② 공식 DB 직링크 (ruling_number 기반) — ①이 없거나 ①이 공식DB가 아닐 때 보조 제공
+  // ② 공식 DB 직링크 (ruling_number 기반) — ①이 없을 때 보조 제공
   else if (official && official.rulingUrl && item.ruling_number) {
     var directUrl = official.rulingUrl.replace('{NUM}', encodeURIComponent(String(item.ruling_number).trim()));
-    buttons.push(btn(directUrl, '원문 보기 (' + official.agency + ')', '#b71c1c'));
+    buttons.push(btn(directUrl, '원문 보기 (' + official.agency + ')', '#c62828'));
   }
 
   // 검색어 조합: Ruling번호 + 제목(현지/영문) + 기관명
@@ -418,11 +459,11 @@ function _buildSourceLink(item) {
   if (official && baseQuery) {
     if (official.searchUrl) {
       buttons.push(btn(official.searchUrl.replace('{Q}', encodeURIComponent(baseQuery)),
-                       '공식 DB 검색 (' + official.agency + ')', '#2e7d32'));
+                       '공식 DB 검색 (' + official.agency + ')', '#2e8b57'));
     } else if (official.domain) {
       var siteUrl = 'https://www.google.com/search?q=' +
                     encodeURIComponent(baseQuery + ' site:' + official.domain);
-      buttons.push(btn(siteUrl, '공식 사이트 검색 (' + official.agency + ')', '#2e7d32'));
+      buttons.push(btn(siteUrl, '공식 사이트 검색 (' + official.agency + ')', '#2e8b57'));
     }
   }
 
@@ -432,7 +473,7 @@ function _buildSourceLink(item) {
     if (item.source) gParts.push(String(item.source).split(' ')[0]);
     var googleUrl = 'https://www.google.com/search?q=' + encodeURIComponent(gParts.join(' ')) +
                     '&hl=' + langCfg.hl + '&gl=' + langCfg.gl;
-    buttons.push(btn(googleUrl, '구글 검색', '#1565c0'));
+    buttons.push(btn(googleUrl, '구글 검색', '#15418c'));
   }
 
   if (!buttons.length) return '<span style="color:#aaa;font-size:12px;">링크 정보 없음</span>';
@@ -737,7 +778,8 @@ function _loadLastReportData() {
       issue_date     : row[12],
       url            : row[13],
       url_status     : row.length > 15 ? row[15] : '',
-      url_source     : row.length > 16 ? row[16] : ''
+      url_source     : row.length > 16 ? row[16] : '',
+      importance     : row.length > 17 ? row[17] : ''
     };
   });
 
@@ -793,11 +835,14 @@ function _buildRequest(region, apiKey, dateRangeStr, year) {
     '2. "url" field — CRITICAL: copy the EXACT URL of the web page where you found this ruling, taken directly from your search results. ' +
        'If you are not 100% sure of the exact URL, set "url" to "" (empty string). NEVER construct, guess or recall a URL from memory.\n' +
     '3. "url_source": the name of the website/publication the url belongs to (e.g., "CBP CROSS", "Lexology", "관세청 보도자료"). Empty if url is empty.\n' +
-    '4. Return AT MOST 15 rulings, most recent first.\n' +
-    '5. Output STRICTLY VALID JSON between the markers: double-quoted keys and strings, no trailing commas, no comments, ' +
+    '4. "importance": rate each ruling — "상" if a monitored company (Samsung, LG Electronics, Apple, etc.) is directly involved as applicant/party, ' +
+       'or the classification of a core monitored product was changed or disputed; "중" if it concerns a monitored product category; ' +
+       '"하" if relevant only by HS chapter. Use exactly one of: 상 / 중 / 하.\n' +
+    '5. Return AT MOST 15 rulings, most recent first.\n' +
+    '6. Output STRICTLY VALID JSON between the markers: double-quoted keys and strings, no trailing commas, no comments, ' +
        'escape internal double quotes as \\". Do not wrap the JSON in markdown code fences.\n' +
-    '6. Briefly describe findings in natural language first, then output the JSON block.\n' +
-    '7. Even if no results: output JSON_RESULT_START\\n[]\\nJSON_RESULT_END\n\n' +
+    '7. Briefly describe findings in natural language first, then output the JSON block.\n' +
+    '8. Even if no results: output JSON_RESULT_START\\n[]\\nJSON_RESULT_END\n\n' +
 
     'JSON_RESULT_START\n' +
     '[\n' +
@@ -814,7 +859,8 @@ function _buildRequest(region, apiKey, dateRangeStr, year) {
     '    "summary": "Classification rationale in Korean (2-3 sentences)",\n' +
     '    "issue_date": "YYYY-MM-DD",\n' +
     '    "url": "",\n' +
-    '    "url_source": ""\n' +
+    '    "url_source": "",\n' +
+    '    "importance": "상 | 중 | 하"\n' +
     '  }\n' +
     ']\n' +
     'JSON_RESULT_END';
@@ -973,7 +1019,7 @@ function _robustJsonParse(text, regionName) {
 
 var DB_HEADERS = ['수집일시', '조회기간', '국가', '기관', 'Ruling번호', 'HS코드',
                   '물품명(KO)', '물품명(EN)', '기업명', '제목(KO)', '제목(EN)', '주요내용',
-                  '게시일', 'URL', '카테고리', 'URL상태', 'URL출처'];
+                  '게시일', 'URL', '카테고리', 'URL상태', 'URL출처', '중요도'];
 
 function _saveToSheet(results, dateRangeStr) {
   var ss    = _getSpreadsheet();
@@ -983,13 +1029,13 @@ function _saveToSheet(results, dateRangeStr) {
   if (sheet.getLastRow() === 0) {
     sheet.appendRow(DB_HEADERS);
     sheet.getRange(1, 1, 1, DB_HEADERS.length)
-      .setFontWeight('bold').setBackground('#1a237e').setFontColor('#ffffff');
+      .setFontWeight('bold').setBackground(SHEET_HEADER_BG).setFontColor('#ffffff');
     sheet.setFrozenRows(1);
   } else if (sheet.getLastColumn() < DB_HEADERS.length) {
     // 구버전(14컬럼) 시트 → 신규 컬럼 헤더 보강
     sheet.getRange(1, sheet.getLastColumn() + 1, 1, DB_HEADERS.length - sheet.getLastColumn())
       .setValues([DB_HEADERS.slice(sheet.getLastColumn())])
-      .setFontWeight('bold').setBackground('#1a237e').setFontColor('#ffffff');
+      .setFontWeight('bold').setBackground(SHEET_HEADER_BG).setFontColor('#ffffff');
   }
   if (!results.length) return;
 
@@ -998,9 +1044,16 @@ function _saveToSheet(results, dateRangeStr) {
     return [now, dateRangeStr, r.country || '', r.source || '', r.ruling_number || '', r.hs_code || '',
             r.product_name || '', r.product_name_en || '', r.company || '', r.title || '',
             r.title_en || '', r.summary || '', r.issue_date || '', r.url || '',
-            r.category || '', r.url_status || '', r.url_source || ''];
+            r.category || '', r.url_status || '', r.url_source || '', r.importance || '중'];
   });
-  sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+  var startRow = sheet.getLastRow() + 1;
+  sheet.getRange(startRow, 1, rows.length, rows[0].length).setValues(rows);
+  // 중요도 '상' 행 전체에 연한 빨간색 하이라이트
+  for (var r = 0; r < rows.length; r++) {
+    if (rows[r][17] === '상') {
+      sheet.getRange(startRow + r, 1, 1, rows[0].length).setBackground(SHEET_HIGHLIGHT_BG);
+    }
+  }
   Logger.log('[saveToSheet] ' + rows.length + '건 저장 완료');
 }
 
@@ -1047,30 +1100,71 @@ function _escapeHtml(s) {
     .replace(/"/g, '&quot;');
 }
 
+/** 뱃지 공통 UI (둥근 테두리, 패딩, 볼드) */
+function _badge(text, fg, bg, border) {
+  return '<span style="display:inline-block;padding:2px 8px;font-size:11px;font-weight:bold;color:' + fg +
+         ';background-color:' + bg + ';border:1px solid ' + (border || bg) +
+         ';border-radius:3px;margin-right:4px;">' + text + '</span>';
+}
+
+/** 아이템 카드: 좌측 중요도 컬러바 + 뱃지 + 타이틀 원문 링크(#15418c 언더라인) */
+function _buildItemCard(item) {
+  var imp      = (item.importance === '상' || item.importance === '하') ? item.importance : '중';
+  var impColor = IMPORTANCE_COLORS[imp];
+  var impBg    = IMPORTANCE_BG[imp];
+
+  var badges = _badge('중요도 ' + imp, impColor, impBg, impColor);
+  if (item.hs_code) badges += _badge('HS ' + _escapeHtml(item.hs_code), '#15418c', '#e8eef7', '#c9d6ea');
+  if (item.company) badges += _badge(_escapeHtml(item.company), '#7b3000', '#fdf3e7', '#ecd9c0');
+  if (item.ruling_number) {
+    badges += '<span style="font-size:11px;color:#8a93a3;">[' + _escapeHtml(item.ruling_number) + ']</span>';
+  }
+
+  var titleKo   = _escapeHtml(item.title || item.product_name || '제목 없음');
+  var titleEn   = _escapeHtml(item.title_en || item.product_name_en || '');
+  var directUrl = _directOriginalUrl(item);
+  var titleHtml = directUrl
+    ? '<a href="' + _escapeHtml(directUrl) + '" target="_blank" style="color:#15418c;text-decoration:underline;">' + titleKo + '</a>'
+    : '<span style="color:#1f2733;">' + titleKo + '</span>';
+
+  return '<table width="100%" cellpadding="0" cellspacing="0" border="0" ' +
+         'style="border:1px solid #dde1e7;background-color:#ffffff;">' +
+    '<tr>' +
+      '<td width="5" bgcolor="' + impColor + '" style="width:5px;background-color:' + impColor + ';font-size:0;line-height:0;">&nbsp;</td>' +
+      '<td style="padding:12px 16px;">' +
+        '<div style="margin-bottom:7px;">' + badges + '</div>' +
+        '<div style="font-size:13px;font-weight:bold;line-height:1.5;">' + titleHtml + '</div>' +
+        (titleEn ? '<div style="font-size:11px;color:#6b7686;margin-top:3px;line-height:1.5;">' + titleEn + '</div>' : '') +
+        '<table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:9px;">' +
+          '<tr>' +
+            '<td style="width:70px;font-size:11px;color:#8a93a3;font-weight:bold;padding-bottom:5px;vertical-align:top;">물품명</td>' +
+            '<td style="font-size:12px;color:#333333;padding-bottom:5px;line-height:1.6;">' +
+              _escapeHtml(item.product_name || '-') +
+              (item.product_name_en ? '<span style="color:#999999;margin-left:6px;font-size:11px;">(' + _escapeHtml(item.product_name_en) + ')</span>' : '') +
+            '</td>' +
+          '</tr>' +
+          '<tr>' +
+            '<td style="width:70px;font-size:11px;color:#8a93a3;font-weight:bold;padding-bottom:5px;vertical-align:top;">주요내용</td>' +
+            '<td style="font-size:12px;color:#333333;line-height:1.7;padding-bottom:5px;">' + _escapeHtml(item.summary || '-') + '</td>' +
+          '</tr>' +
+          '<tr>' +
+            '<td style="width:70px;font-size:11px;color:#8a93a3;font-weight:bold;vertical-align:top;">게시일</td>' +
+            '<td style="font-size:12px;color:#333333;">' + _escapeHtml(item.issue_date || '-') + '</td>' +
+          '</tr>' +
+        '</table>' +
+        '<div style="border-top:1px solid #eef1f5;padding-top:9px;margin-top:10px;">' + _buildSourceLink(item) + '</div>' +
+      '</td>' +
+    '</tr>' +
+  '</table>';
+}
+
 function _buildEmailHtml(results, dateRangeStr, dupCount) {
   var now        = _fmtDateTime(new Date());
   var totalCount = results.length;
 
   // ※ MONITORING_REGIONS의 category와 반드시 일치해야 함 (불일치 시 해당 카테고리 메일 누락)
   var CATEGORY_ORDER = ['동북아', '중국', '북미', '중남미', '인도', '유럽', '중동', '동남아', '아프리카', 'CIS', '글로벌'];
-  var CAT_META = {
-    '동북아'  : { color: '#1565c0', bg: '#e3f2fd' },
-    '중국'    : { color: '#c62828', bg: '#ffebee' },
-    '북미'    : { color: '#bf360c', bg: '#fbe9e7' },
-    '중남미'  : { color: '#2e7d32', bg: '#e8f5e9' },
-    '인도'    : { color: '#e65100', bg: '#fff3e0' },
-    '유럽'    : { color: '#1a237e', bg: '#e8eaf6' },
-    '중동'    : { color: '#4e342e', bg: '#efebe9' },
-    '동남아'  : { color: '#00695c', bg: '#e0f2f1' },
-    '아프리카': { color: '#558b2f', bg: '#f1f8e9' },
-    'CIS'     : { color: '#4527a0', bg: '#ede7f6' },
-    '글로벌'  : { color: '#37474f', bg: '#eceff1' }
-  };
-  var COUNTRY_COLOR = {
-    '한국': '#1565c0', '일본': '#283593', '중국': '#c62828', '미국': '#b71c1c', '캐나다': '#bf360c',
-    '멕시코': '#2e7d32', '브라질': '#1b5e20', '인도': '#e65100', 'EU': '#1a237e', '영국': '#0d47a1'
-  };
-  function getCountryColor(c) { return COUNTRY_COLOR[c] || '#546e7a'; }
+  var IMP_RANK = { '상': 0, '중': 1, '하': 2 };
 
   var byCat = {};
   results.forEach(function(r) {
@@ -1089,108 +1183,64 @@ function _buildEmailHtml(results, dateRangeStr, dupCount) {
   var statsBadges = '';
   renderOrder.forEach(function(cat) {
     if (!byCat[cat]) return;
-    var cnt  = Object.keys(byCat[cat]).reduce(function(s, c) { return s + byCat[cat][c].length; }, 0);
-    var meta = CAT_META[cat] || { color: '#546e7a', bg: '#eceff1' };
+    var cnt      = Object.keys(byCat[cat]).reduce(function(s, c) { return s + byCat[cat][c].length; }, 0);
+    var catColor = CATEGORY_COLORS[cat] || '#546e7a';
     statsBadges +=
       '<td align="center" style="padding:6px 10px;">' +
-        '<div style="font-size:17px;font-weight:bold;color:' + meta.color + ';">' + cnt + '</div>' +
-        '<div style="font-size:10px;color:#666;margin-top:1px;">' + _escapeHtml(cat) + '</div>' +
+        '<div style="font-size:17px;font-weight:bold;color:' + catColor + ';">' + cnt + '</div>' +
+        '<div style="font-size:10px;color:#666666;margin-top:1px;">' + _escapeHtml(cat) + '</div>' +
       '</td>';
   });
 
   var cardHtml = '';
   if (totalCount === 0) {
     cardHtml =
-      '<tr><td style="padding:40px 24px;text-align:center;">' +
-        '<div style="background:#f8f9fa;border-radius:8px;padding:30px;border:1px dashed #ccc;">' +
-          '<p style="font-size:15px;color:#555;margin:0 0 8px 0;font-weight:bold;">이번 기간 신규 Ruling 사례 없음</p>' +
-          '<p style="font-size:13px;color:#888;margin:0;">검색 기간 ' + dateRangeStr + ' (최근 ' + MONITORING_DAYS + '일) 내 조건에 맞는 신규 Ruling이 확인되지 않았습니다.' +
+      '<tr><td style="padding:40px 28px;text-align:center;">' +
+        '<div style="background-color:#f4f6f8;padding:30px;border:1px dashed #c3ccd6;">' +
+          '<p style="font-size:15px;color:#555555;margin:0 0 8px 0;font-weight:bold;">이번 기간 신규 Ruling 사례 없음</p>' +
+          '<p style="font-size:13px;color:#888888;margin:0;">검색 기간 ' + dateRangeStr + ' (최근 ' + MONITORING_DAYS + '일) 내 조건에 맞는 신규 Ruling이 확인되지 않았습니다.' +
           (dupCount > 0 ? '<br>(기존 수집분과 중복된 ' + dupCount + '건은 제외되었습니다.)' : '') + '</p>' +
         '</div>' +
       '</td></tr>';
   } else {
     renderOrder.forEach(function(cat) {
       if (!byCat[cat]) return;
-      var catMeta  = CAT_META[cat] || { color: '#546e7a', bg: '#eceff1' };
+      var catColor = CATEGORY_COLORS[cat] || '#546e7a';
       var catCount = Object.keys(byCat[cat]).reduce(function(s, c) { return s + byCat[cat][c].length; }, 0);
 
+      // 카테고리 섹션 헤더: 카테고리 테마 컬러 솔리드 배경 + 흰색 텍스트
       cardHtml +=
-        '<tr><td style="padding:20px 24px 4px 24px;">' +
-          '<div style="background:' + catMeta.bg + ';border-left:5px solid ' + catMeta.color + ';' +
-               'border-radius:0 6px 6px 0;padding:10px 16px;">' +
-            '<span style="font-size:15px;font-weight:bold;color:' + catMeta.color + ';">' + _escapeHtml(cat) + '</span>' +
-            '<span style="margin-left:10px;background:' + catMeta.color + ';color:#fff;' +
-                 'font-size:11px;font-weight:bold;padding:2px 9px;border-radius:10px;">' +
-              catCount + '건</span>' +
-          '</div>' +
+        '<tr><td style="padding:20px 28px 4px 28px;">' +
+          '<table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>' +
+            '<td bgcolor="' + catColor + '" style="background-color:' + catColor + ';padding:9px 16px;">' +
+              '<span style="font-size:14px;font-weight:bold;color:#ffffff;">' + _escapeHtml(cat) + '</span>' +
+              '<span style="display:inline-block;margin-left:10px;background-color:#ffffff;color:' + catColor + ';' +
+                   'font-size:11px;font-weight:bold;padding:1px 8px;border-radius:9px;">' + catCount + '건</span>' +
+            '</td>' +
+          '</tr></table>' +
         '</td></tr>';
 
       Object.keys(byCat[cat]).forEach(function(country) {
-        var items        = byCat[cat][country];
-        var countryColor = getCountryColor(country);
-        var source       = items[0].source || '';
+        var items = byCat[cat][country];
+        // 중요도 상 → 중 → 하 순으로 정렬
+        items.sort(function(a, b) {
+          var ra = IMP_RANK[a.importance] !== undefined ? IMP_RANK[a.importance] : 1;
+          var rb = IMP_RANK[b.importance] !== undefined ? IMP_RANK[b.importance] : 1;
+          return ra - rb;
+        });
+        var source = items[0].source || '';
 
         cardHtml +=
-          '<tr><td style="padding:8px 24px 4px 36px;">' +
-            '<span style="font-size:13px;font-weight:bold;color:' + countryColor + ';' +
-                 'border-bottom:2px solid ' + countryColor + ';padding-bottom:2px;">' + _escapeHtml(country) + '</span>' +
-            '<span style="font-size:11px;color:#999;margin-left:8px;">' + _escapeHtml(source) + '</span>' +
-            '<span style="font-size:11px;color:#fff;background:' + countryColor + ';' +
-                 'border-radius:8px;padding:1px 7px;margin-left:6px;font-weight:bold;">' +
-              items.length + '건</span>' +
+          '<tr><td style="padding:10px 28px 4px 28px;">' +
+            '<span style="font-size:13px;font-weight:bold;color:' + catColor + ';' +
+                 'border-bottom:2px solid ' + catColor + ';padding-bottom:2px;">' + _escapeHtml(country) + '</span>' +
+            '<span style="font-size:11px;color:#8a93a3;margin-left:8px;">' + _escapeHtml(source) + '</span>' +
+            '<span style="display:inline-block;font-size:11px;color:#ffffff;background-color:' + catColor + ';' +
+                 'border-radius:8px;padding:1px 7px;margin-left:6px;font-weight:bold;">' + items.length + '건</span>' +
           '</td></tr>';
 
         items.forEach(function(item) {
-          var hsTag = item.hs_code
-            ? '<span style="background:#e3f2fd;color:#0d47a1;font-size:11px;font-weight:bold;' +
-                   'padding:2px 7px;border-radius:4px;margin-left:6px;font-family:monospace;">' + _escapeHtml(item.hs_code) + '</span>'
-            : '';
-          var coTag = item.company
-            ? '<span style="background:#fce8e6;color:#b71c1c;font-size:11px;padding:2px 7px;' +
-                   'border-radius:4px;margin-left:4px;">' + _escapeHtml(item.company) + '</span>'
-            : '';
-          var rulingTag = item.ruling_number
-            ? '<span style="color:#aaa;font-size:11px;margin-left:6px;">[' + _escapeHtml(item.ruling_number) + ']</span>'
-            : '';
-          var titleKo = _escapeHtml(item.title || item.product_name || '제목 없음');
-          var titleEn = _escapeHtml(item.title_en || item.product_name_en || '');
-
-          var urlLink = _buildSourceLink(item);
-
-          cardHtml +=
-            '<tr><td style="padding:3px 24px 8px 36px;">' +
-              '<table width="100%" cellpadding="0" cellspacing="0" ' +
-                     'style="border:1px solid #e0e0e0;border-radius:8px;overflow:hidden;background:#fff;">' +
-                '<tr><td style="background:#f9f9f9;padding:11px 16px;border-bottom:1px solid #eeeeee;">' +
-                  '<div style="font-size:13px;font-weight:bold;color:#202124;line-height:1.5;">' +
-                    titleKo + hsTag + coTag + rulingTag +
-                  '</div>' +
-                  (titleEn ? '<div style="font-size:11px;color:#666;margin-top:3px;">' + titleEn + '</div>' : '') +
-                '</td></tr>' +
-                '<tr><td style="padding:11px 16px;">' +
-                  '<table width="100%" cellpadding="0" cellspacing="0">' +
-                    '<tr>' +
-                      '<td style="width:70px;font-size:11px;color:#888;font-weight:bold;padding-bottom:6px;vertical-align:top;">물품명</td>' +
-                      '<td style="font-size:12px;color:#333;padding-bottom:6px;">' +
-                        _escapeHtml(item.product_name || '-') +
-                        (item.product_name_en ? '<span style="color:#999;margin-left:6px;font-size:11px;">(' + _escapeHtml(item.product_name_en) + ')</span>' : '') +
-                      '</td>' +
-                    '</tr>' +
-                    '<tr>' +
-                      '<td style="width:70px;font-size:11px;color:#888;font-weight:bold;padding-bottom:6px;vertical-align:top;">주요내용</td>' +
-                      '<td style="font-size:12px;color:#333;line-height:1.7;padding-bottom:6px;">' + _escapeHtml(item.summary || '-') + '</td>' +
-                    '</tr>' +
-                    '<tr>' +
-                      '<td style="width:70px;font-size:11px;color:#888;font-weight:bold;padding-bottom:6px;">게시일</td>' +
-                      '<td style="font-size:12px;color:#333;padding-bottom:6px;">' + _escapeHtml(item.issue_date || '-') + '</td>' +
-                    '</tr>' +
-                  '</table>' +
-                '</td></tr>' +
-                '<tr><td style="padding:7px 16px 10px 16px;background:#fafafa;border-top:1px solid #eeeeee;">' +
-                  urlLink +
-                '</td></tr>' +
-              '</table>' +
-            '</td></tr>';
+          cardHtml += '<tr><td style="padding:4px 28px 8px 28px;">' + _buildItemCard(item) + '</td></tr>';
         });
       });
     });
@@ -1198,52 +1248,52 @@ function _buildEmailHtml(results, dateRangeStr, dupCount) {
 
   return '<!DOCTYPE html>' +
   '<html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>' +
-  '<body style="margin:0;padding:0;background:#f1f3f4;font-family:\'Malgun Gothic\',\'Apple SD Gothic Neo\',Arial,sans-serif;">' +
-  '<table width="100%" cellpadding="0" cellspacing="0" style="background:#f1f3f4;padding:24px 0;"><tr><td align="center">' +
-  '<table width="680" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,0.10);">' +
+  '<body style="margin:0;padding:0;background-color:#eef1f5;">' +
+  '<table width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#eef1f5;"><tr><td align="center" style="padding:24px 0;">' +
+  '<table width="680" cellpadding="0" cellspacing="0" border="0" ' +
+         'style="width:680px;max-width:680px;background-color:#ffffff;border:1px solid #dde1e7;font-family:' + FONT_STACK + ';">' +
 
-  '<tr><td style="background:linear-gradient(135deg,#0d1b5e 0%,#1565c0 100%);padding:28px 28px 22px 28px;">' +
-    '<div style="color:#90caf9;font-size:11px;font-weight:bold;letter-spacing:2.5px;text-transform:uppercase;margin-bottom:6px;">Trade Compliance Intelligence</div>' +
-    '<div style="color:#ffffff;font-size:21px;font-weight:bold;line-height:1.3;margin-bottom:3px;">HS Code 유권해석 주간 동향 보고서</div>' +
-    '<div style="color:#bbdefb;font-size:14px;margin-bottom:10px;">Weekly HS Classification Ruling Monitoring Report</div>' +
-    '<table cellpadding="0" cellspacing="0"><tr>' +
-      '<td style="color:#bbdefb;font-size:13px;">조회 기간&nbsp;' + dateRangeStr + '</td>' +
-      '<td style="color:#bbdefb;font-size:13px;padding-left:20px;">발행일&nbsp;' + now + '</td>' +
-    '</tr></table>' +
+  // 헤더 (네이비 #14294a — bgcolor 속성 병기로 Outlook 호환)
+  '<tr><td bgcolor="#14294a" style="padding:26px 28px;background-color:#14294a;">' +
+    '<div style="color:#8fb3e8;font-size:11px;font-weight:bold;letter-spacing:2.5px;text-transform:uppercase;margin-bottom:6px;">Trade Compliance Intelligence</div>' +
+    '<div style="color:#ffffff;font-size:21px;font-weight:bold;line-height:1.35;margin-bottom:3px;">HS Code 유권해석 주간 동향 보고서</div>' +
+    '<div style="color:#b8cdf0;font-size:13px;line-height:1.5;margin-bottom:10px;">Weekly HS Classification Ruling Monitoring Report</div>' +
+    '<div style="color:#b8cdf0;font-size:12px;line-height:1.6;">조회 기간&nbsp;' + dateRangeStr + '&nbsp;&nbsp;|&nbsp;&nbsp;발행일&nbsp;' + now + '</div>' +
   '</td></tr>' +
 
-  '<tr><td style="background:#e8f0fe;padding:12px 28px;border-bottom:2px solid #c5cae9;">' +
-    '<table width="100%" cellpadding="0" cellspacing="0"><tr>' +
-      '<td style="font-size:13px;color:#1a237e;">' +
-        '<b>이번 기간 수집 현황</b>&nbsp;&nbsp;|&nbsp;&nbsp;' +
-        '신규 <b style="color:#1565c0;font-size:15px;">' + totalCount + '</b>건' +
-        (dupCount > 0 ? ' <span style="color:#888;font-size:11px;">(중복 ' + dupCount + '건 제외)</span>' : '') +
-        ' &nbsp;|&nbsp;&nbsp;' +
-        '<b style="color:#1565c0;">' + MONITORING_REGIONS.length + '</b>개 검색 패스 (최근 ' + MONITORING_DAYS + '일)' +
-      '</td>' +
-    '</tr></table>' +
+  // 수록 기준 안내 (연초록 배경 + 초록 상단 보더)
+  '<tr><td bgcolor="#eaf6ee" style="padding:10px 28px;background-color:#eaf6ee;border-top:3px solid #2e8b57;border-bottom:1px solid #d6e9dd;">' +
+    '<div style="font-size:12px;color:#1d4d33;line-height:1.7;">' +
+      '<b>이번 기간 수집 현황</b>&nbsp;:&nbsp;신규 <b>' + totalCount + '</b>건' +
+      (dupCount > 0 ? ' <span style="color:#5d7a68;">(중복 ' + dupCount + '건 제외)</span>' : '') +
+      '&nbsp;&nbsp;|&nbsp;&nbsp;' + MONITORING_REGIONS.length + '개 검색 패스 · 최근 ' + MONITORING_DAYS + '일' +
+      '&nbsp;&nbsp;|&nbsp;&nbsp;중요도&nbsp;' +
+      '<b style="color:#c62828;">상</b>(모니터링 기업 직접 관련)&nbsp;·&nbsp;' +
+      '<b style="color:#ef6c00;">중</b>(모니터링 품목)&nbsp;·&nbsp;' +
+      '<b style="color:#2e7d32;">하</b>(HS류 관련)' +
+    '</div>' +
   '</td></tr>' +
 
   (totalCount > 0
     ? '<tr><td style="padding:14px 28px 8px 28px;">' +
-        '<div style="font-size:10px;font-weight:bold;color:#999;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:8px;">카테고리별 수집 현황</div>' +
-        '<table cellpadding="0" cellspacing="0"><tr>' + statsBadges + '</tr></table>' +
+        '<div style="font-size:10px;font-weight:bold;color:#8a93a3;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:8px;">카테고리별 수집 현황</div>' +
+        '<table cellpadding="0" cellspacing="0" border="0"><tr>' + statsBadges + '</tr></table>' +
       '</td></tr>'
     : '') +
 
   // 재발송 안내 배너
   '<tr><td style="padding:10px 28px 4px 28px;">' +
-    '<div style="background:#fff8e1;border:1px solid #ffe082;border-radius:6px;padding:9px 14px;font-size:12px;color:#795548;">' +
-      ' <b>재발송 요청</b>: 이 메일에 "<b>HS 요청</b>"이라고 답장하시면 최신 리포트를 즉시 재발송해 드립니다.' +
+    '<div style="background-color:#fff8e1;border:1px solid #ffe082;padding:9px 14px;font-size:12px;color:#795548;">' +
+      '<b>재발송 요청</b>: 이 메일에 "<b>HS 요청</b>"이라고 답장하시면 최신 리포트를 즉시 재발송해 드립니다.' +
     '</div>' +
   '</td></tr>' +
 
-  '<tr><td style="padding:14px 28px 8px 28px;border-top:1px solid #eeeeee;">' +
-    '<table width="100%" cellpadding="0" cellspacing="0"><tr>' +
+  '<tr><td style="padding:14px 28px 8px 28px;border-top:1px solid #eef1f5;">' +
+    '<table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>' +
       '<td width="48%" style="vertical-align:top;padding-right:8px;">' +
-        '<div style="background:#f5f5f5;border-radius:6px;padding:11px 14px;">' +
-          '<div style="font-size:10px;font-weight:bold;color:#888;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px;">모니터링 품목</div>' +
-          '<div style="font-size:12px;color:#333;line-height:1.9;">' +
+        '<div style="background-color:#f4f6f8;border:1px solid #e3e7ec;padding:11px 14px;">' +
+          '<div style="font-size:10px;font-weight:bold;color:#8a93a3;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px;">모니터링 품목</div>' +
+          '<div style="font-size:12px;color:#333333;line-height:1.9;">' +
             '스마트폰 / 태블릿 / 스마트워치 / 블루투스 이어폰<br>' +
             '에어컨 / 오븐 / 냉장고 / 청소기 / TV / 모니터 / 사운드바<br>' +
             '스마트글래스 / 히트펌프 / 칠러(Chiller) / 전자칠판 / 에어드레서<br>' +
@@ -1253,9 +1303,9 @@ function _buildEmailHtml(results, dateRangeStr, dupCount) {
         '</div>' +
       '</td>' +
       '<td width="52%" style="vertical-align:top;padding-left:8px;">' +
-        '<div style="background:#f5f5f5;border-radius:6px;padding:11px 14px;">' +
-          '<div style="font-size:10px;font-weight:bold;color:#888;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px;">모니터링 기업</div>' +
-          '<div style="font-size:12px;color:#333;line-height:1.9;">' +
+        '<div style="background-color:#f4f6f8;border:1px solid #e3e7ec;padding:11px 14px;">' +
+          '<div style="font-size:10px;font-weight:bold;color:#8a93a3;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px;">모니터링 기업</div>' +
+          '<div style="font-size:12px;color:#333333;line-height:1.9;">' +
             'Apple / Samsung Electronics / LG Electronics<br>' +
             'Huawei / Xiaomi / Oppo / Vivo<br>' +
             'Whirlpool / General Electric / Haier' +
@@ -1267,8 +1317,9 @@ function _buildEmailHtml(results, dateRangeStr, dupCount) {
 
   cardHtml +
 
-  '<tr><td style="background:#0d1b5e;padding:16px 28px;text-align:center;">' +
-    '<div style="color:#90caf9;font-size:11px;line-height:1.8;">' +
+  // 푸터 (네이비 #14294a)
+  '<tr><td bgcolor="#14294a" style="padding:16px 28px;text-align:center;background-color:#14294a;">' +
+    '<div style="color:#8fb3e8;font-size:11px;line-height:1.8;">' +
       'Gemini AI 기반 자동 모니터링 시스템 &nbsp;|&nbsp; 매주 월요일 오전 9시 KST 정기 발행 (최근 ' + MONITORING_DAYS + '일)<br>' +
       '원문 보기 링크는 AI 검색 출처 기반으로 자동 수집·검증되며, 부정확할 수 있으니 중요 사안은 반드시 공식 DB에서 재확인하세요.' +
     '</div>' +
