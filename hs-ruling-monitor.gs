@@ -2,6 +2,14 @@
  * HS Code 유권해석(Ruling) 주간 모니터링 시스템
  * ─────────────────────────────────────────────
  * [변경 이력]
+ * v4.1 (미국 결과 정밀화 — 분류 룰링 사례만)
+ *  - 미국 수집에 일반 관세정책(관세율·반덤핑·301/232조·쿼터·수수료·FTA/원산지 등)이 섞이던 문제 수정:
+ *      · CBP CROSS: category 필드가 비면 전부 통과하던 버그 수정 → HTS 분류번호 보유 + 비분류(평가/원산지/마킹) 제목 제외
+ *      · Federal Register: 정책 고시 발행물 특성상 노이즈가 많아, '분류 룰링레터 수정/철회 고시'만 채택하고
+ *        정책 키워드(POLICY_EXCLUDE_TERMS)는 제외
+ *      · 미국 Gemini 패스: Section 301 등 정책 항목 제거 → CIT/CAFC '품목분류 판결'만 수집
+ *      · 전 지역 Gemini 프롬프트에 [MANDATORY GATE] 추가 — 제품 분류 결정/판결만, 일반 관세정책은 강제 제외
+ *
  * v4.0 (HS 한정 · 최대 수집 · 원문 영구 확인)
  *  - [핵심] 공식 API 직접 수집(하이브리드) 도입:
  *      · 美 CBP CROSS 분류 결정 JSON API(rulings.cbp.gov/api/search) — 검색어별 최신순 전수 수집,
@@ -97,6 +105,21 @@ var MONITORED_PRODUCT_TERMS = ['smartphone', 'mobile phone', 'cellular', 'tablet
   'x-ray', 'medical imaging'];
 var MONITORED_HS_CHAPTERS = ['39', '40', '42', '72', '73', '83', '84', '85', '90', '91', '94'];
 
+// HS 품목분류 '결정/룰링'이 아닌 일반 관세정책·통상조치를 걸러내기 위한 제외 키워드.
+// (관세율 변경·반덤핑/상계관세·세이프가드·232/301조·쿼터·수수료·환급·원산지/FTA·통계 등)
+var POLICY_EXCLUDE_TERMS = [
+  'antidumping', 'anti-dumping', 'countervailing', 'safeguard', 'section 301', 'section 232',
+  'section 201', 'duty rate', 'tariff rate', 'rate of duty', 'tariff increase', 'tariff hike',
+  'quota', 'tariff-rate quota', 'trq', 'cobra fee', 'user fee', 'mpf ', 'drawback',
+  'de minimis', 'reciprocal tariff', 'ieepa', 'trade agreement', 'free trade', 'fta ',
+  'rules of origin', 'country of origin marking', 'forced labor', 'uflpa', 'sanction',
+  'export control', 'aphis', 'statistical', 'comment period', 'meeting', 'COAC'
+];
+
+// FedReg에서 '분류 룰링 사례'로 인정할 신호어 (룰링레터 수정/철회 고시 등)
+var FEDREG_RULING_SIGNALS = ['ruling letter', 'classification ruling', 'revocation of', 'modification of',
+  'revoke', 'modify', 'tariff classification of', 'reconsideration of'];
+
 // Gmail 폴링용 라벨 (처리 완료 메일 마킹 — 없으면 자동 생성)
 var PROCESSED_LABEL = 'HS-요청-처리완료';
 
@@ -156,13 +179,14 @@ var MONITORING_REGIONS = [
   // ── 북미 ──
   {
     category: '북미', region: '미국',
-    source  : 'U.S. CIT/CAFC 판결 · 통상 분쟁 (CROSS는 API 직수집)',
-    // ※ 일상적 CROSS 결정은 CBP API로 전수 수집하므로, 여기서는 그 外 보완 영역에 집중
-    prompt  : 'Search for NOTABLE US HS tariff classification developments in the last {DAYS} days, EXCLUDING routine CBP CROSS ruling letters (those are collected separately). ' +
-              'Focus on: Court of International Trade (CIT) and Federal Circuit (CAFC) classification judgments, classification disputes/litigation, Section 301/exclusion classification issues, and trade-press analysis of significant US classification decisions. ' +
+    source  : 'U.S. CIT/CAFC 품목분류 판결 (CROSS는 API 직수집)',
+    // ※ 일상적 CROSS 결정은 CBP API로 전수 수집하므로, 여기서는 그 外 '분류 판결'만 보완
+    prompt  : 'Search ONLY for actual HS tariff CLASSIFICATION ruling cases or court decisions from the US in the last {DAYS} days, EXCLUDING routine CBP CROSS ruling letters (collected separately). ' +
+              'Collect ONLY: Court of International Trade (CIT) or Federal Circuit (CAFC) JUDGMENTS that decide the correct HTSUS classification of a specific product, and formal classification disputes that turn on which HTS heading applies. ' +
+              'STRICTLY EXCLUDE general trade-policy items: Section 301/232/201 actions, tariff-rate or duty-rate changes, antidumping/countervailing duties, quotas, fees, FTA/origin, sanctions, export controls. ' +
               'Look in: cit.uscourts.gov, cafc.uscourts.gov, Sandler Travis, law firm trade alerts, Lexology, Law360. ' +
-              'Keywords: "CIT tariff classification decision" "CAFC classification HTSUS" "classification litigation" "smartphone" "air conditioner" "Samsung" "Apple" "LG" "{YEAR}". ' +
-              'Do NOT limit results to official DB only — news articles and trade reports are acceptable.'
+              'Keywords: "CIT tariff classification decision" "CAFC HTSUS classification holding" "proper classification under heading" "smartphone" "air conditioner" "Samsung" "Apple" "LG" "{YEAR}". ' +
+              'Each result MUST be about how a specific product is classified (an HTS heading/subheading determination), not a tariff-rate or policy measure.'
   },
   {
     category: '북미', region: '캐나다',
@@ -710,14 +734,24 @@ function _collectCbpRulings(periodStart) {
       var d = dateStr ? new Date(dateStr) : null;
       if (d && !isNaN(d.getTime()) && d < periodStart) return;  // 기간 밖
 
-      // 분류(Tariff Classification) 결정만 — HS 한정
-      var cat = String(r.category || r.rulingType || r.type || '').toLowerCase();
-      if (cat && cat.indexOf('class') === -1) return;
-
       var tariffs = r.tariffs || r.tariff || r.htsNumbers || r.htsnumbers || [];
       if (!Array.isArray(tariffs)) tariffs = tariffs ? [tariffs] : [];
       var hs = tariffs.length ? String(tariffs[0]) : '';
       var subject = r.subject || r.title || r.rulingReference || r.description || '';
+
+      // ── HS 한정: 품목분류(Tariff Classification) 결정만 채택 ──
+      // CROSS는 분류 外에 평가(Valuation)·원산지(Marking/Origin)·기타 룰링도 포함하므로 엄격 필터.
+      var cat = String(r.category || r.rulingType || r.type || '').toLowerCase();
+      if (cat) {
+        // category 필드가 있으면 'classification'을 명시한 건만
+        if (cat.indexOf('class') === -1) return;
+      } else {
+        // category 필드가 없으면(필드명 변동 등) HTS 분류번호 존재 여부로 분류 룰링 판정
+        if (!hs) return;
+        // 제목이 명백히 비분류(평가/원산지/마킹)인 건 제외
+        var subjLow = subject.toLowerCase();
+        if (/\b(valuation|country of origin|marking|drawback|protest)\b/.test(subjLow)) return;
+      }
 
       bySeen[num] = true;
       kept++;
@@ -748,12 +782,14 @@ function _collectCbpRulings(periodStart) {
 
 /**
  * 美 Federal Register 직접 수집 (무인증 JSON API).
- * CBP가 발행하는 분류 관련 고시/결정(Customs Bulletin 등)을 영구 html_url과 함께 수집.
+ * ※ Federal Register는 본질적으로 정책·고시 발행물이라 관세율/반덤핑/301조 등 노이즈가 많다.
+ *   따라서 '품목분류 룰링레터의 수정·철회 고시'처럼 실제 HS 분류 룰링 사례에 해당하는 건만 채택하고,
+ *   일반 관세정책(POLICY_EXCLUDE_TERMS)은 제외한다. (revocation/modification of ruling letters)
  */
 function _collectFederalRegister(periodStart) {
   var url = 'https://www.federalregister.gov/api/v1/documents.json' +
-    '?per_page=80&order=newest' +
-    '&conditions[term]=' + encodeURIComponent('tariff classification') +
+    '?per_page=100&order=newest' +
+    '&conditions[term]=' + encodeURIComponent('tariff classification ruling letters') +
     '&conditions[agencies][]=u-s-customs-and-border-protection' +
     '&conditions[publication_date][gte]=' + _fmtDate(periodStart) +
     '&fields[]=title&fields[]=html_url&fields[]=publication_date&fields[]=abstract&fields[]=document_number';
@@ -768,28 +804,37 @@ function _collectFederalRegister(periodStart) {
   var data;
   try { data = JSON.parse(resp.getContentText()); } catch (e) { return []; }
 
-  return (data.results || []).map(function(r) {
+  var out = [];
+  (data.results || []).forEach(function(r) {
     var title = r.title || '';
+    var hay   = (title + ' ' + (r.abstract || '')).toLowerCase();
+
+    // ① 분류 룰링 신호어가 하나도 없으면 제외
+    if (!FEDREG_RULING_SIGNALS.some(function(s) { return hay.indexOf(s) !== -1; })) return;
+    // ② 일반 관세정책·통상조치 키워드가 있으면 제외 (단, 분류 룰링 수정/철회 고시는 신호어로 이미 통과)
+    if (POLICY_EXCLUDE_TERMS.some(function(s) { return hay.indexOf(s.trim()) !== -1; })) return;
+
     var item = {
       category       : '북미',
       country        : '미국',
-      source         : 'U.S. Federal Register (CBP)',
+      source         : 'U.S. Federal Register (CBP 분류 룰링 고시)',
       ruling_number  : r.document_number || '',
       hs_code        : '',
       product_name   : '',
       product_name_en: '',
-      company        : _detectCompany(title + ' ' + (r.abstract || '')),
+      company        : _detectCompany(hay),
       title          : '',
       title_en       : title,
-      summary        : String(r.abstract || '품목분류 관련 고시/결정').substring(0, 300),
+      summary        : String(r.abstract || '품목분류 룰링레터 수정/철회 고시').substring(0, 300),
       issue_date     : r.publication_date || '',
       url            : r.html_url || '',
       url_source     : 'Federal Register',
       url_status     : r.html_url ? 'OK(API)' : ''
     };
     item.importance = _autoImportance(item);
-    return item;
+    out.push(item);
   });
+  return out;
 }
 
 /** 텍스트에서 모니터링 기업명 탐지 (API 항목은 기업 필드가 없으므로 제목/요약에서 추출) */
@@ -1046,7 +1091,16 @@ function _buildRequest(region, apiKey, dateRangeStr, year) {
     dateRangeStr + ' (last ' + MONITORING_DAYS + ' days). ' +
     'Rulings ISSUED earlier but newly REPORTED/PUBLISHED within this period are also acceptable.\n\n' +
 
-    '[ COLLECTION CRITERIA — OR condition ]\n\n' +
+    '[ MANDATORY GATE — collect ONLY genuine HS classification rulings ]\n' +
+    'Every item MUST be a specific HS/tariff CLASSIFICATION decision — i.e. a customs authority advance/binding classification ruling, ' +
+    'a classification determination, or a court/tribunal judgment deciding which HS heading/subheading a specific product falls under. ' +
+    'Each item MUST be tied to an identifiable product and (ideally) an HS code.\n' +
+    'STRICTLY EXCLUDE general tariff/trade policy that is NOT a product classification decision: ' +
+    'tariff-rate or duty-rate changes, antidumping/countervailing/safeguard duties, Section 301/232/201 actions, reciprocal/IEEPA tariffs, ' +
+    'quotas, customs fees, drawback, de minimis, FTA/preferential-origin or rules-of-origin, export controls, sanctions, ' +
+    'general trade statistics, agendas, or meeting/comment notices. If an item is not a product classification ruling, DO NOT include it.\n\n' +
+
+    '[ COLLECTION CRITERIA — OR condition (applied AFTER the mandatory gate above) ]\n\n' +
 
     '▶ A. Collect if the ruling relates to ANY of the following products:\n' +
     '   Smartphone, mobile phone, tablet, smartwatch, smart glasses, Bluetooth earphones, earbuds,\n' +
