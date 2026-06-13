@@ -2,6 +2,18 @@
  * HS Code 유권해석(Ruling) 주간 모니터링 시스템
  * ─────────────────────────────────────────────
  * [변경 이력]
+ * v4.2 (정확성·필터 레이어 + EU 직수집 강화)
+ *  - [정확성] 수집·검증 후 정확성/필터 레이어(_refineResults) 신설:
+ *      · 스코프 필터(_scopeMatch): 회사/제품군/HS류(MONITORED_HS_CHAPTERS) 중 하나라도 매칭해야 채택 + 매칭근거 태깅
+ *        → 죽어 있던 MONITORED_HS_CHAPTERS를 HS코드 정규화(_normalizeHs) 후 실제 작동
+ *      · 미검증 AI검색 항목(원문 URL 없음/접속실패)은 제외 (DROP_UNVERIFIED_AI) — 단 회사 직접 '상'은 예외 유지
+ *      · 너무 과거(STALE_RULING_MONTHS) 게시일 항목 제외
+ *      · 출처유형(공식/AI검색) 판정 → 메일 배지 + 시트 컬럼으로 신뢰도 명시
+ *  - [EU 강화] EU 분류규칙 직수집(EUR-Lex/CELLAR SPARQL, 무인증) — CELEX 영구 URL.
+ *      EU Gemini 패스를 2개(분류규칙·CJEU / EBTI·회원국 BTI)로 분리해 recall 확대.
+ *      OFFICIAL_DB EU 검색링크를 EUR-Lex 쿼리형으로 개선. testEuEurlex() 진단 추가.
+ *  - 동향DB 컬럼 추가: 출처유형 / HS류 / 매칭근거
+ *
  * v4.1 (미국 결과 정밀화 — 분류 룰링 사례만)
  *  - 미국 수집에 일반 관세정책(관세율·반덤핑·301/232조·쿼터·수수료·FTA/원산지 등)이 섞이던 문제 수정:
  *      · CBP CROSS: category 필드가 비면 전부 통과하던 버그 수정 → HTS 분류번호 보유 + 비분류(평가/원산지/마킹) 제목 제외
@@ -83,8 +95,16 @@ var URL_VERIFY_MAX = 60;
 // 나머지 국가는 Gemini google_search 그라운딩으로 보완.
 var USE_CBP_API          = true;   // 美 CBP CROSS 분류 결정 JSON API (무인증)
 var USE_FEDERAL_REGISTER = true;   // 美 Federal Register API (무인증) — CBP 분류 고시/결정
+var USE_EU_EURLEX        = true;   // EU EUR-Lex(CELLAR SPARQL) 분류규칙 직수집 (무인증, best-effort)
 var CBP_PAGE_SIZE        = 50;     // CBP 검색어당 최대 조회 건수 (최신순)
 var CBP_MAX_PER_TERM     = 50;     // 검색어당 기간 내 채택 상한
+var EURLEX_MAX           = 80;     // EU 분류규칙 최대 수집 건수
+
+// ─── 정확성/출처 정책 (1단계) ───────────────────────────────────────────────
+// 검증되지 않은 AI검색 항목(원문 URL 없음/접속실패)은 제외한다. 단, 회사 직접 관련 '상' 중요도는 예외로 유지.
+var DROP_UNVERIFIED_AI   = true;
+// issue_date가 조회기간 시작보다 이만큼(개월) 이전이면 '오래된 룰링'으로 보고 제외 (보도 지연 감안한 여유)
+var STALE_RULING_MONTHS  = 12;
 
 // CBP CROSS 검색어 — 모니터링 품목/기업 (검색어 1개 = API 1회 호출)
 var CBP_SEARCH_TERMS = [
@@ -251,14 +271,23 @@ var MONITORING_REGIONS = [
               'Do NOT limit results to official DB only — news articles and trade reports are acceptable.'
   },
 
-  // ── 유럽 ──
+  // ── 유럽 ── (EU는 EUR-Lex 분류규칙을 API로도 직수집하며, Gemini는 2개 보완 패스로 분리)
   {
     category: '유럽', region: 'EU',
-    source  : 'EU BTI (Binding Tariff Information)',
-    prompt  : 'Search for HS Code tariff classification rulings from the European Union published in the last {DAYS} days. ' +
-              'Look broadly in: EU BTI/EBTI database (ec.europa.eu), EU Classification Regulations published in the Official Journal (EUR-Lex), CJEU tariff classification judgments, EU customs news, and any web source reporting on EU customs classification. ' +
-              'Keywords: "EU classification regulation Combined Nomenclature" "Commission Implementing Regulation classification" "BTI binding tariff information" "CJEU tariff classification" "smartphone" "air conditioner" "Samsung" "Apple" "{YEAR}". ' +
-              'Do NOT limit results to official DB only — news articles and trade reports are acceptable.'
+    source  : 'EU 분류규칙(Official Journal) / CJEU 판결',
+    prompt  : 'Search for EU HS tariff CLASSIFICATION acts published in the last {DAYS} days. ' +
+              'Focus on: (1) Commission Implementing Regulations "concerning the classification of certain goods in the Combined Nomenclature" in the EU Official Journal (find them on EUR-Lex, eur-lex.europa.eu), and ' +
+              '(2) Court of Justice of the EU (CJEU) judgments deciding the CN/HS classification of a specific product (curia.europa.eu). ' +
+              'For each, capture the CELEX number (e.g. 32026Rxxxx) or case number (e.g. C-123/25) as ruling_number, the EUR-Lex/CURIA URL, the CN code, and the product. ' +
+              'Keywords: "classification of certain goods in the Combined Nomenclature" "Commission Implementing Regulation (EU) classification" "CJEU tariff classification judgment" "smartphone" "air conditioner" "monitor" "Samsung" "Apple" "{YEAR}".'
+  },
+  {
+    category: '유럽', region: 'EU(BTI)', countryName: 'EU',
+    source  : 'EU EBTI / 회원국 BTI (Binding Tariff Information)',
+    prompt  : 'Search for newly issued EU Binding Tariff Information (BTI/EBTI) rulings and EU member-state customs classification decisions in the last {DAYS} days. ' +
+              'Look in: the EU EBTI public database (ec.europa.eu/taxation_customs/dds2/ebti), German (Verbindliche Zolltarifauskunft / vZTA), French, Dutch, and other member-state customs BTI rulings, and EU customs trade press. ' +
+              'For each, capture the BTI reference (e.g. DEBTIxxxxx) as ruling_number, the CN code, the product, and the issuing member state (put it in title_en, keep country as EU). ' +
+              'Keywords: "Binding Tariff Information" "verbindliche Zolltarifauskunft" "EBTI reference" "renseignement tarifaire contraignant" "smartphone" "earbuds" "air conditioner" "Samsung" "Apple" "{YEAR}".'
   },
   {
     category: '유럽', region: '영국',
@@ -392,8 +421,8 @@ var OFFICIAL_DB = {
   '칠레'            : { agency: 'Aduana Chile',          domain: 'aduana.cl' },
   '파나마'          : { agency: 'ANA',                   domain: 'ana.gob.pa' },
   '인도'            : { agency: 'CBIC',                  domain: 'cbic.gov.in' },
-  'EU'              : { agency: 'EU EBTI',               domain: 'ec.europa.eu',
-                        searchUrl: 'https://ec.europa.eu/taxation_customs/dds2/ebti/ebti_consultation.jsp?Lang=en' },
+  'EU'              : { agency: 'EUR-Lex / EBTI',         domain: 'eur-lex.europa.eu',
+                        searchUrl: 'https://eur-lex.europa.eu/search.html?type=quick&lang=en&text={Q}' },
   '영국'            : { agency: 'UK Trade Tariff',       domain: 'gov.uk',
                         searchUrl: 'https://www.trade-tariff.service.gov.uk/search?q={Q}' },
   '튀르키예'        : { agency: 'Ticaret Bakanlığı',     domain: 'ticaret.gov.tr' },
@@ -605,6 +634,13 @@ function runHSRulingMonitor() {
       Logger.log('[Federal Register API] ' + fr.length + '건 수집');
     } catch (e) { Logger.log('[Federal Register API] 오류: ' + e.message); }
   }
+  if (USE_EU_EURLEX) {
+    try {
+      var eu = _collectEuClassificationRegs(periodStart);
+      allResults.push.apply(allResults, eu);
+      Logger.log('[EU EUR-Lex API] ' + eu.length + '건 수집');
+    } catch (e) { Logger.log('[EU EUR-Lex API] 오류: ' + e.message); }
+  }
 
   responses.forEach(function(resp, i) {
     var region = MONITORING_REGIONS[i];
@@ -614,7 +650,7 @@ function runHSRulingMonitor() {
       items.forEach(function(item) {
         item.category = region.category;
         if (!region.isGroup) {
-          item.country = region.region;
+          item.country = region.countryName || region.region;
         } else if (!item.country && region.countries && region.countries.length) {
           item.country = region.countries[0];
         }
@@ -635,13 +671,17 @@ function runHSRulingMonitor() {
   var dupCount = allResults.length - deduped.length;
   if (dupCount > 0) Logger.log('[HSRulingMonitor] 중복 ' + dupCount + '건 제외');
 
-  // 수집된 URL 실제 접속 검증
+  // 수집된 URL 실제 접속 검증 (url_status 확정 → 이후 정확성 게이팅에 사용)
   _verifyItemUrls(deduped);
 
-  _saveToSheet(deduped, dateRangeStr);
-  _sendEmail(deduped, dateRangeStr, dupCount);
+  // 정확성·필터 레이어: 스코프(회사/제품/HS류) 미달·기간 외·미검증 항목 제거 + 출처유형/HS류/매칭근거 태깅
+  var refined = _refineResults(deduped, periodStart);
 
-  Logger.log('[HSRulingMonitor] 완료. 신규 ' + deduped.length + '건 / 중복 제외 ' + dupCount + '건.');
+  _saveToSheet(refined, dateRangeStr);
+  _sendEmail(refined, dateRangeStr, dupCount);
+
+  Logger.log('[HSRulingMonitor] 완료. 발송 ' + refined.length + '건 / 수집 ' + deduped.length +
+             '건 / 중복 제외 ' + dupCount + '건.');
 }
 
 // ─── API 호출 배치/재시도 ────────────────────────────────────────────────────
@@ -837,6 +877,73 @@ function _collectFederalRegister(periodStart) {
   return out;
 }
 
+/**
+ * EU 분류규칙 직접 수집 (EUR-Lex / CELLAR SPARQL — 무인증 공개 엔드포인트).
+ * "classification of certain goods in the Combined Nomenclature" 제목의 Commission Implementing Regulation을
+ * 기간 내로 조회 → CELEX 번호로 EUR-Lex 영구 URL 생성.
+ * ※ EU 온톨로지(cdm) 술어명은 변동 가능 → 실패 시 graceful(빈 배열) 반환, Gemini EU 패스가 보완.
+ *   testEuEurlex()로 실제 응답 구조 확인 가능.
+ */
+function _collectEuClassificationRegs(periodStart) {
+  var sparql =
+    'PREFIX cdm: <http://publications.europa.eu/ontology/cdm#> ' +
+    'PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> ' +
+    'SELECT DISTINCT ?celex ?title ?date WHERE { ' +
+    '  ?work cdm:resource_legal_id_celex ?celex . ' +
+    '  ?work cdm:work_date_document ?date . ' +
+    '  ?exp cdm:expression_belongs_to_work ?work . ' +
+    '  ?exp cdm:expression_title ?title . ' +
+    '  FILTER(CONTAINS(LCASE(STR(?title)), "classification of certain goods in the combined nomenclature")) ' +
+    '  FILTER(?date >= "' + _fmtDate(periodStart) + '"^^xsd:date) ' +
+    '} ORDER BY DESC(?date) LIMIT ' + EURLEX_MAX;
+
+  var url = 'https://publications.europa.eu/webapi/rdf/sparql?query=' +
+            encodeURIComponent(sparql) + '&format=application%2Fsparql-results%2Bjson';
+
+  var resp;
+  try { resp = UrlFetchApp.fetch(url, { method: 'get', muteHttpExceptions: true,
+                                        headers: { 'Accept': 'application/sparql-results+json' } }); }
+  catch (e) { Logger.log('[EU EUR-Lex] fetch 오류: ' + e.message); return []; }
+  if (resp.getResponseCode() !== 200) {
+    Logger.log('[EU EUR-Lex] HTTP ' + resp.getResponseCode() + ' — Gemini EU 패스로 보완');
+    return [];
+  }
+
+  var bindings;
+  try { bindings = JSON.parse(resp.getContentText()).results.bindings; }
+  catch (e) { Logger.log('[EU EUR-Lex] 파싱 오류'); return []; }
+
+  var seen = {}, out = [];
+  (bindings || []).forEach(function(b) {
+    var celex = b.celex && b.celex.value ? b.celex.value : '';
+    var title = b.title && b.title.value ? b.title.value : '';
+    var date  = b.date && b.date.value ? String(b.date.value).substring(0, 10) : '';
+    if (!celex || seen[celex]) return;
+    seen[celex] = true;
+
+    var item = {
+      category       : '유럽',
+      country        : 'EU',
+      source         : 'EU 분류규칙 (Official Journal / EUR-Lex)',
+      ruling_number  : celex,
+      hs_code        : '',
+      product_name   : '',
+      product_name_en: '',
+      company        : _detectCompany(title),
+      title          : '',
+      title_en       : title,
+      summary        : 'EU 통합명명법(CN) 품목분류 시행규칙',
+      issue_date     : date,
+      url            : 'https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:' + encodeURIComponent(celex),
+      url_source     : 'EUR-Lex',
+      url_status     : 'OK(API)'   // 공식 영구 URL
+    };
+    item.importance = _autoImportance(item);
+    out.push(item);
+  });
+  return out;
+}
+
 /** 텍스트에서 모니터링 기업명 탐지 (API 항목은 기업 필드가 없으므로 제목/요약에서 추출) */
 function _detectCompany(text) {
   var low = String(text || '').toLowerCase();
@@ -856,6 +963,86 @@ function _autoImportance(item) {
   if (MONITORED_COMPANIES.some(function(c) { return hay.indexOf(c) !== -1; })) return '상';
   if (MONITORED_PRODUCT_TERMS.some(function(p) { return hay.indexOf(p) !== -1; })) return '중';
   return '하';
+}
+
+// ─── 정확성·필터 레이어 (1단계) ─────────────────────────────────────────────
+
+/** HS코드 문자열에서 숫자만 추출해 {chapter(2자리), code6} 반환 */
+function _normalizeHs(hs) {
+  var digits = String(hs || '').replace(/[^0-9]/g, '');
+  return { chapter: digits.substring(0, 2), code6: digits.substring(0, 6), digits: digits };
+}
+
+/** 항목이 모니터링 범위(회사/제품군/HS류)에 드는지 판정 + 매칭근거 반환 */
+function _scopeMatch(item) {
+  var hay = (String(item.title_en || '') + ' ' + String(item.title || '') + ' ' +
+             String(item.summary || '') + ' ' + String(item.product_name_en || '') + ' ' +
+             String(item.product_name || '') + ' ' + String(item.company || '')).toLowerCase();
+  var co = String(item.company || '').toLowerCase();
+
+  if (co && MONITORED_COMPANIES.some(function(c) { return co.indexOf(c) !== -1; }))
+    return { pass: true, reason: '회사:' + item.company };
+  var hitCo = MONITORED_COMPANIES.filter(function(c) { return hay.indexOf(c) !== -1; });
+  if (hitCo.length) return { pass: true, reason: '회사:' + hitCo[0] };
+
+  var hitP = MONITORED_PRODUCT_TERMS.filter(function(p) { return hay.indexOf(p) !== -1; });
+  if (hitP.length) return { pass: true, reason: '제품:' + hitP[0].trim() };
+
+  var ch = _normalizeHs(item.hs_code).chapter;
+  if (ch && MONITORED_HS_CHAPTERS.indexOf(ch) !== -1) return { pass: true, reason: 'HS류:' + ch };
+
+  return { pass: false, reason: '' };
+}
+
+/** 출처유형: 공식 API/DB 직수집인가, AI(Gemini) 검색인가 */
+function _provenanceOf(item) {
+  if (String(item.url_status || '').indexOf('OK(API)') !== -1) return '공식';
+  var s = String(item.source || '');
+  if (/CBP|Federal Register|EUR-Lex|EBTI|분류규칙/.test(s)) return '공식';
+  return 'AI검색';
+}
+
+/** issue_date가 너무 과거(STALE_RULING_MONTHS개월 이전)면 stale */
+function _isStale(item, periodStart) {
+  var d = new Date(item.issue_date);
+  if (isNaN(d.getTime())) return false; // 날짜 불명은 통과(보도지연 등)
+  var cutoff = new Date(periodStart.getTime());
+  cutoff.setMonth(cutoff.getMonth() - STALE_RULING_MONTHS);
+  return d < cutoff;
+}
+
+/**
+ * 수집·검증 후 정확성/필터 일괄 적용.
+ *  1) 스코프(회사/제품/HS류) 미달 → 제외
+ *  2) stale(너무 과거 게시일) → 제외
+ *  3) 미검증 AI검색 항목 → 제외 (단 회사 직접 관련 '상'은 예외 유지)
+ *  통과 항목에 provenance / hs_chapter / match_reason 태깅.
+ */
+function _refineResults(items, periodStart) {
+  var drop = { scope: 0, stale: 0, unverified: 0 };
+  var out  = [];
+  items.forEach(function(it) {
+    var m = _scopeMatch(it);
+    if (!m.pass) { drop.scope++; return; }
+    if (_isStale(it, periodStart)) { drop.stale++; return; }
+
+    it.provenance = _provenanceOf(it);
+    it.hs_chapter = _normalizeHs(it.hs_code).chapter;
+    it.match_reason = m.reason;
+
+    // 출처 불분명 = 원문 URL이 없거나 접속 실패한 AI검색 항목 (단순 미점검 'SKIP'은 유지)
+    var hasUrl = it.url && /^https?:\/\//i.test(it.url);
+    var failed = String(it.url_status || '').indexOf('FAIL') !== -1;
+    if (DROP_UNVERIFIED_AI && it.provenance === 'AI검색' && (!hasUrl || failed)) {
+      var keepException = (it.importance === '상' && it.company);  // 회사 직접 '상'은 예외 유지
+      if (!keepException) { drop.unverified++; return; }
+      it.url_status = it.url_status || '미검증';
+    }
+    out.push(it);
+  });
+  Logger.log('[refine] 제외 — 스코프 ' + drop.scope + ' / 과거 ' + drop.stale + ' / 미검증 ' + drop.unverified +
+             ' → 통과 ' + out.length);
+  return out;
 }
 
 // ─── 중복 제거 ───────────────────────────────────────────────────────────────
@@ -1056,7 +1243,10 @@ function _loadLastReportData() {
       url            : row[13],
       url_status     : row.length > 15 ? row[15] : '',
       url_source     : row.length > 16 ? row[16] : '',
-      importance     : row.length > 17 ? row[17] : ''
+      importance     : row.length > 17 ? row[17] : '',
+      provenance     : row.length > 18 ? row[18] : '',
+      hs_chapter     : row.length > 19 ? row[19] : '',
+      match_reason   : row.length > 20 ? row[20] : ''
     };
   });
 
@@ -1305,7 +1495,8 @@ function _robustJsonParse(text, regionName) {
 
 var DB_HEADERS = ['수집일시', '조회기간', '국가', '기관', 'Ruling번호', 'HS코드',
                   '물품명(KO)', '물품명(EN)', '기업명', '제목(KO)', '제목(EN)', '주요내용',
-                  '게시일', 'URL', '카테고리', 'URL상태', 'URL출처', '중요도'];
+                  '게시일', 'URL', '카테고리', 'URL상태', 'URL출처', '중요도',
+                  '출처유형', 'HS류', '매칭근거'];
 
 function _saveToSheet(results, dateRangeStr) {
   var ss    = _getSpreadsheet();
@@ -1330,7 +1521,8 @@ function _saveToSheet(results, dateRangeStr) {
     return [now, dateRangeStr, r.country || '', r.source || '', r.ruling_number || '', r.hs_code || '',
             r.product_name || '', r.product_name_en || '', r.company || '', r.title || '',
             r.title_en || '', r.summary || '', r.issue_date || '', r.url || '',
-            r.category || '', r.url_status || '', r.url_source || '', r.importance || '중'];
+            r.category || '', r.url_status || '', r.url_source || '', r.importance || '중',
+            r.provenance || '', r.hs_chapter || '', r.match_reason || ''];
   });
   var startRow = sheet.getLastRow() + 1;
   sheet.getRange(startRow, 1, rows.length, rows[0].length).setValues(rows);
@@ -1400,6 +1592,9 @@ function _buildItemCard(item) {
   var impBg    = IMPORTANCE_BG[imp];
 
   var badges = _badge('중요도 ' + imp, impColor, impBg, impColor);
+  // 출처유형: 공식(검증) vs AI검색 — 신뢰도 구분
+  if (item.provenance === '공식') badges += _badge('공식·검증', '#1b5e3b', '#e7f4ec', '#bfe0cc');
+  else if (item.provenance === 'AI검색') badges += _badge('AI검색', '#6d3b00', '#fbf0e3', '#e7cfb0');
   if (item.hs_code) badges += _badge('HS ' + _escapeHtml(item.hs_code), '#15418c', '#e8eef7', '#c9d6ea');
   if (item.company) badges += _badge(_escapeHtml(item.company), '#7b3000', '#fdf3e7', '#ecd9c0');
   if (item.ruling_number) {
@@ -1705,6 +1900,27 @@ function testFederalRegister() {
   items.slice(0, 5).forEach(function(it) {
     Logger.log('  - ' + it.title_en + ' | ' + it.issue_date + ' | ' + it.url);
   });
+}
+
+/**
+ * EU EUR-Lex(CELLAR SPARQL) 분류규칙 수집 확인용 — 최초 1회 실행 권장.
+ * 0건이면 SPARQL 술어명(cdm) 변동 가능 → 로그의 raw 응답을 보고 _collectEuClassificationRegs 조정.
+ */
+function testEuEurlex() {
+  var since = new Date(Date.now() - 180 * 24 * 60 * 60 * 1000);
+  var items = _collectEuClassificationRegs(since);
+  Logger.log('[testEuEurlex] 최근 180일 분류규칙 ' + items.length + '건');
+  items.slice(0, 8).forEach(function(it) {
+    Logger.log('  - [' + it.ruling_number + '] ' + it.title_en + ' | ' + it.issue_date + ' | ' + it.url);
+  });
+  if (!items.length) {
+    Logger.log('[testEuEurlex] 0건 — SPARQL 응답 직접 확인:');
+    var sparql = 'SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 1';
+    var url = 'https://publications.europa.eu/webapi/rdf/sparql?query=' + encodeURIComponent(sparql) +
+              '&format=application%2Fsparql-results%2Bjson';
+    var resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    Logger.log('  endpoint HTTP ' + resp.getResponseCode() + ': ' + resp.getContentText().substring(0, 400));
+  }
 }
 
 /**

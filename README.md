@@ -16,6 +16,29 @@ HS 품목분류 유권해석 사례를 주간 수집하여 구글 시트에 저�
    - 15분마다 "HS 요청" 메일 폴링 트리거
 4. (선택) `testSingleRegion(3)` 으로 미국(CBP) 단일 패스 동작 확인
 
+## v4.2 — 정확성·필터 레이어 + EU 직수집 강화
+
+수집 후 **검증·필터 단계가 없던 구조**에 정확성/필터 레이어(`_refineResults`)를 신설하고, EU 수집을 대폭 보강.
+
+### 정확성·필터 (회사·HS·제품군)
+- **통합 스코프 필터**(`_scopeMatch`): 회사 / 제품군 / HS류(`MONITORED_HS_CHAPTERS`) 중 하나라도 매칭해야 채택, 매칭근거를 기록.
+  → 정의만 되고 안 쓰이던 `MONITORED_HS_CHAPTERS`를 HS코드 정규화(`_normalizeHs`) 후 실제 작동.
+- **미검증 항목 제외**: 원문 URL이 없거나 접속 실패한 AI검색 항목은 제외(`DROP_UNVERIFIED_AI`).
+  단, **회사 직접 관련 '상' 중요도는 예외로 유지**. (단순 미점검 `SKIP`은 살림 — 쿼터로 인한 과도 누락 방지)
+- **오래된 룰링 제외**: 게시일이 조회기간보다 `STALE_RULING_MONTHS`(기본 12개월) 이전이면 제외.
+- **출처유형 명시**: 공식(검증) vs AI검색을 메일 배지 + 시트 컬럼으로 구분 → 신뢰도 한눈에.
+
+### EU 수집 강화
+- **EU 분류규칙 직수집**(EUR-Lex / CELLAR SPARQL, 무인증): Official Journal의 "classification of certain goods
+  in the Combined Nomenclature" 시행규칙을 기간 내 조회 → **CELEX 영구 URL**(`eur-lex.europa.eu/.../CELEX:...`).
+- **EU Gemini 패스 2분할**: ① 분류규칙 + CJEU 판결, ② EBTI/회원국 BTI(독일 vZTA 등) → recall 확대.
+- `OFFICIAL_DB` EU 링크를 EUR-Lex 쿼리 검색형으로 개선. 진단 함수 `testEuEurlex()` 추가.
+- 토글 `USE_EU_EURLEX` (best-effort, 실패 시 Gemini EU 패스가 보완).
+- ※ SPARQL 술어명 변동 가능 → 최초 1회 `testEuEurlex()`로 수집 여부 확인 권장.
+
+### 동향DB 컬럼 추가
+`출처유형` / `HS류` / `매칭근거` (구버전 시트 자동 보강).
+
 ## v4.1 — 미국 결과 정밀화 (분류 룰링 사례만)
 
 미국 수집에 일반 관세정책(관세율 변경·반덤핑/상계·Section 301/232·쿼터·수수료·FTA/원산지 등)이 섞이던 문제를 수정.
