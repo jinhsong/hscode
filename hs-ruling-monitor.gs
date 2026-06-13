@@ -942,7 +942,7 @@ function checkHsRequestEmails() {
   }
 
   var fromFilter  = recipients.map(function(e) { return 'from:' + e; }).join(' OR ');
-  var searchQuery = '(' + fromFilter + ') ("HS 요청") -label:' + PROCESSED_LABEL + ' newer_than:1d';
+  var searchQuery = '(' + fromFilter + ') subject:("HS 요청") -label:' + PROCESSED_LABEL + ' newer_than:1d';
 
   var threads = GmailApp.search(searchQuery);
   Logger.log('[checkHsRequestEmails] 감지된 스레드 수: ' + threads.length);
@@ -1512,13 +1512,6 @@ function _buildEmailHtml(results, dateRangeStr, dupCount) {
         '<table cellpadding="0" cellspacing="0" border="0"><tr>' + statsBadges + '</tr></table>' +
       '</td></tr>'
     : '') +
-
-  // 재발송 안내 배너
-  '<tr><td style="padding:10px 28px 4px 28px;">' +
-    '<div style="background-color:#fff8e1;border:1px solid #ffe082;padding:9px 14px;font-size:12px;color:#795548;">' +
-      '<b>재발송 요청</b>: 이 메일에 "<b>HS 요청</b>"이라고 답장하시면 최신 리포트를 즉시 재발송해 드립니다.' +
-    '</div>' +
-  '</td></tr>' +
 
   '<tr><td style="padding:14px 28px 8px 28px;border-top:1px solid #eef1f5;">' +
     '<table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>' +
