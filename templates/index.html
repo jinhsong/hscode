@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>수입모델 인증 확인 (KC · 전파)</title>
+  <style>
+    body { font-family: -apple-system, "Segoe UI", "Malgun Gothic", sans-serif;
+           max-width: 1000px; margin: 24px auto; padding: 0 16px; color: #1c2024; }
+    h1 { font-size: 20px; }
+    .demo { background:#fff7e6; border:1px solid #ffd591; padding:8px 12px;
+            border-radius:6px; font-size:13px; margin-bottom:16px; }
+    textarea { width: 100%; height: 140px; font-family: monospace; font-size: 13px;
+               padding: 8px; box-sizing: border-box; }
+    .row { display:flex; gap:12px; align-items:center; margin:10px 0; flex-wrap:wrap; }
+    button { background:#1971c2; color:#fff; border:0; padding:9px 18px; border-radius:6px;
+             font-size:14px; cursor:pointer; }
+    button:disabled { opacity:.5; cursor:default; }
+    table { border-collapse: collapse; width: 100%; margin-top:16px; font-size:13px; }
+    th, td { border:1px solid #dee2e6; padding:7px 9px; text-align:left; vertical-align:top; }
+    th { background:#f1f3f5; }
+    .ok   { color:#2b8a3e; font-weight:600; }
+    .no   { color:#c92a2a; font-weight:600; }
+    .warn { color:#e8590c; font-weight:600; }
+    .sub { color:#868e96; font-size:11px; }
+    .badge { font-size:11px; padding:1px 6px; border-radius:4px; background:#e7f5ff; color:#1971c2; }
+  </style>
+</head>
+<body>
+  <h1>수입모델 인증 확인 · KC 안전인증 / 전파인증</h1>
+  {% if demo %}
+  <div class="demo">⚠️ <b>데모 모드</b>입니다 (DATA_GO_KR_SERVICE_KEY 미설정).
+    내장 샘플 DB로 매칭만 시연합니다. 예: <code>SM-X300akak</code>, <code>SM-X306abc</code>,
+    <code>SM-S921xyz</code>, <code>SM-A999zzz</code> 를 넣어보세요.</div>
+  {% endif %}
+
+  <p>모델 full code 를 한 줄에 하나씩 입력하거나 CSV 파일을 올리세요.</p>
+  <textarea id="codes" placeholder="SM-X300akak&#10;SM-S921xyz&#10;EP-TA800qq"></textarea>
+
+  <div class="row">
+    <button id="run">조회</button>
+    <input type="file" id="csv" accept=".csv,text/csv" />
+    <span id="status" class="sub"></span>
+    <a href="#" id="export" style="display:none">결과 CSV 내려받기</a>
+  </div>
+
+  <div id="out"></div>
+
+  <script>
+    const $ = (s) => document.querySelector(s);
+    let lastResults = [];
+
+    function cell(c) {
+      // c: {match_type, matched_model, cert_num, product_name, maker}
+      if (!c.match_type) {
+        const note = c.product_name && c.product_name.startsWith("(") ? c.product_name : "";
+        return `<span class="no">미확인</span> <div class="sub">${note}</div>`;
+      }
+      const label = c.match_type === "exact" ? '<span class="ok">인증됨</span>'
+                  : c.match_type === "prefix" ? '<span class="ok">인증됨</span> <span class="badge">basic 매칭</span>'
+                  : '<span class="warn">유사(확인필요)</span>';
+      return `${label}
+        <div class="sub">모델: <b>${c.matched_model||''}</b><br>
+        인증번호: ${c.cert_num||'-'}<br>
+        ${c.product_name||''} ${c.maker?('· '+c.maker):''}</div>`;
+    }
+
+    function render(results) {
+      if (!results.length) { $("#out").innerHTML = ""; return; }
+      let h = `<table><thead><tr>
+        <th>입력 full code</th><th>KC 안전인증</th><th>전파인증</th></tr></thead><tbody>`;
+      for (const r of results) {
+        h += `<tr><td><code>${r.full_code}</code></td>
+              <td>${cell(r.kc)}</td><td>${cell(r.rra)}</td></tr>`;
+      }
+      h += "</tbody></table>";
+      $("#out").innerHTML = h;
+      $("#export").style.display = "inline";
+    }
+
+    async function run() {
+      $("#run").disabled = true; $("#status").textContent = "조회 중…";
+      try {
+        let res;
+        const file = $("#csv").files[0];
+        if (file) {
+          const fd = new FormData(); fd.append("file", file);
+          res = await fetch("/api/check", { method: "POST", body: fd });
+        } else {
+          res = await fetch("/api/check", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text: $("#codes").value }) });
+        }
+        const data = await res.json();
+        lastResults = data.results;
+        render(lastResults);
+        $("#status").textContent = `${data.count}건 완료`;
+      } catch (e) {
+        $("#status").textContent = "오류: " + e;
+      } finally { $("#run").disabled = false; }
+    }
+
+    $("#run").addEventListener("click", run);
+
+    $("#export").addEventListener("click", (e) => {
+      e.preventDefault();
+      const rows = [["full_code","KC_결과","KC_모델","KC_인증번호","전파_결과","전파_모델","전파_인증번호"]];
+      for (const r of lastResults) {
+        rows.push([r.full_code,
+          r.kc.match_type||"미확인", r.kc.matched_model||"", r.kc.cert_num||"",
+          r.rra.match_type||"미확인", r.rra.matched_model||"", r.rra.cert_num||""]);
+      }
+      const csv = rows.map(r => r.map(v => `"${(v+"").replace(/"/g,'""')}"`).join(",")).join("\n");
+      const blob = new Blob(["﻿"+csv], { type: "text/csv;charset=utf-8" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob); a.download = "cert_results.csv"; a.click();
+    });
+  </script>
+</body>
+</html>
