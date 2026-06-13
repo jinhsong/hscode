@@ -16,6 +16,29 @@ HS 품목분류 유권해석 사례를 주간 수집하여 구글 시트에 저�
    - 15분마다 "HS 요청" 메일 폴링 트리거
 4. (선택) `testSingleRegion(3)` 으로 미국(CBP) 단일 패스 동작 확인
 
+## v4.0 — HS 한정 · 최대 수집 · 원문 영구 확인 (하이브리드)
+
+모델 요약(Gemini google_search)에만 의존하던 구조에서, **공식 API 직접 수집 + Gemini 보완**의 하이브리드로 전환.
+
+### 공식 API 직접 수집 (영구 원문 URL + 대량 수집)
+- **美 CBP CROSS** (`rulings.cbp.gov/api/search`, 무인증 JSON): 모니터링 품목/기업 검색어별로 최신순 전수 조회 →
+  기간 내 **품목분류(Tariff Classification) 결정만** 채택. 원문은 `rulings.cbp.gov/ruling/{번호}` **영구 canonical URL**.
+- **美 Federal Register** (무인증 JSON API): CBP 분류 고시/결정을 영구 `html_url`과 함께 수집.
+- API가 없는 국가(중남미·중동·아프리카·CIS 등)는 기존 Gemini 그라운딩으로 보완.
+- 미국 Gemini 패스는 CROSS 중복을 피해 **CIT/CAFC 분류 판결·통상 분쟁·언론** 보완용으로 재조정.
+- 토글: `USE_CBP_API`, `USE_FEDERAL_REGISTER` / 검색어: `CBP_SEARCH_TERMS`.
+
+### 원문 URL 영구화 (가장 중요)
+- Gemini 그라운딩이 주는 `vertexaisearch...redirect` URL은 **임시 링크(만료)** 라 아카이브엔 부적합.
+- `_resolveFinalUrl()` 이 리다이렉트를 수동 추적해 **최종 도착 canonical URL**을 잡아 저장 →
+  동향DB에 쌓인 원문 링크가 몇 주 뒤에도 살아 있음. 접속 상태(`OK`/`FAIL`/`SKIP`)도 함께 기록.
+- 공식 API URL은 영구 보장되므로 검증 생략(`OK(API)`).
+
+### 설정/진단
+- 최초 1회 `testCbpApi()` 실행 → 로그에서 CBP API 실제 응답 필드 확인(다르면 `_collectCbpRulings` 폴백 필드 조정).
+- `testFederalRegister()` 로 Federal Register 수집 확인.
+- API 항목은 모델 판정이 없으므로 `_autoImportance()`(상=기업 직접 / 중=품목 / 하=HS류)로 중요도 자동 산정.
+
 ## v3.1 디자인 리뉴얼
 
 - **테마 상수**: `FONT_STACK`, `CATEGORY_COLORS`(카테고리별 다크 톤), `IMPORTANCE_COLORS`/`IMPORTANCE_BG`(상 빨강 / 중 주황 / 하 초록)

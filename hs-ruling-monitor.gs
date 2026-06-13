@@ -2,6 +2,19 @@
  * HS Code 유권해석(Ruling) 주간 모니터링 시스템
  * ─────────────────────────────────────────────
  * [변경 이력]
+ * v4.0 (HS 한정 · 최대 수집 · 원문 영구 확인)
+ *  - [핵심] 공식 API 직접 수집(하이브리드) 도입:
+ *      · 美 CBP CROSS 분류 결정 JSON API(rulings.cbp.gov/api/search) — 검색어별 최신순 전수 수집,
+ *        원문은 rulings.cbp.gov/ruling/{번호} 영구 canonical URL (모델 요약 의존 탈피)
+ *      · 美 Federal Register API(무인증) — CBP 분류 고시/결정 영구 html_url 수집
+ *      · API 없는 국가는 기존 Gemini google_search 그라운딩으로 보완
+ *      · 미국 Gemini 패스는 CROSS 外(CIT/CAFC 판결·통상 분쟁·언론)로 재조정해 중복 최소화
+ *  - [핵심] 원문 URL 영구화: 그라운딩 vertexaisearch 리다이렉트(임시·만료)를 수동 추적해
+ *      최종 도착 canonical URL을 잡아 저장 → 아카이브 링크가 시간이 지나도 살아 있음
+ *  - API 항목 자동 중요도 산정(_autoImportance) + 제목/요약에서 모니터링 기업 탐지(_detectCompany)
+ *  - URL 검증 한도 25 → 60, 공식 API URL은 검증 생략
+ *  - 진단 함수 testCbpApi() / testFederalRegister() 추가
+ *
  * v3.1
  *  - 디자인 리뉴얼 (레퍼런스 테마 적용):
  *      · 글로벌 테마 상수 도입 (FONT_STACK / CATEGORY_COLORS / IMPORTANCE_COLORS / IMPORTANCE_BG)
@@ -55,7 +68,34 @@ var API_BATCH_PAUSE_MS = 2000;
 var API_MAX_RETRY      = 2;     // 429/5xx 시 개별 재시도 횟수
 
 // URL 실접속 검증 최대 건수 (Apps Script 6분 실행 제한 고려)
-var URL_VERIFY_MAX = 25;
+var URL_VERIFY_MAX = 60;
+
+// ─── 공식 API 직접 수집 (하이브리드) ─────────────────────────────────────────
+// API가 있는 소스는 직접 수집 → 전수에 가까운 수집 + 영구 원문 URL 확보.
+// 나머지 국가는 Gemini google_search 그라운딩으로 보완.
+var USE_CBP_API          = true;   // 美 CBP CROSS 분류 결정 JSON API (무인증)
+var USE_FEDERAL_REGISTER = true;   // 美 Federal Register API (무인증) — CBP 분류 고시/결정
+var CBP_PAGE_SIZE        = 50;     // CBP 검색어당 최대 조회 건수 (최신순)
+var CBP_MAX_PER_TERM     = 50;     // 검색어당 기간 내 채택 상한
+
+// CBP CROSS 검색어 — 모니터링 품목/기업 (검색어 1개 = API 1회 호출)
+var CBP_SEARCH_TERMS = [
+  'smartphone', 'mobile phone', 'tablet computer', 'smartwatch', 'smart glasses',
+  'wireless earphones', 'earbuds', 'air conditioner', 'heat pump', 'chiller',
+  'oven', 'refrigerator', 'vacuum cleaner', 'television', 'monitor', 'soundbar',
+  'interactive whiteboard', 'clothing care', 'camera', 'base station', 'antenna',
+  'X-ray', 'Samsung', 'LG Electronics', 'Apple', 'Huawei', 'Xiaomi', 'Whirlpool', 'Haier'
+];
+
+// ─── 자동 중요도/필터 기준 (모델 없이 수집되는 API 항목용) ───────────────────
+var MONITORED_COMPANIES = ['apple', 'samsung', 'lg electronics', 'huawei', 'xiaomi',
+                           'oppo', 'vivo', 'whirlpool', 'general electric', 'haier'];
+var MONITORED_PRODUCT_TERMS = ['smartphone', 'mobile phone', 'cellular', 'tablet', 'smartwatch',
+  'smart glass', 'earphone', 'earbud', 'headphone', 'air conditioner', 'heat pump', 'chiller',
+  'oven', 'refrigerator', 'vacuum', 'television', 'tv ', 'monitor', 'soundbar', 'whiteboard',
+  'clothing care', 'shoe care', 'camera', 'mock-up', 'base station', 'antenna', 'wireless',
+  'x-ray', 'medical imaging'];
+var MONITORED_HS_CHAPTERS = ['39', '40', '42', '72', '73', '83', '84', '85', '90', '91', '94'];
 
 // Gmail 폴링용 라벨 (처리 완료 메일 마킹 — 없으면 자동 생성)
 var PROCESSED_LABEL = 'HS-요청-처리완료';
@@ -116,11 +156,12 @@ var MONITORING_REGIONS = [
   // ── 북미 ──
   {
     category: '북미', region: '미국',
-    source  : 'U.S. CBP CROSS',
-    prompt  : 'Search for HS Code tariff classification rulings from the United States published in the last {DAYS} days. ' +
-              'Look broadly in: CBP CROSS (rulings.cbp.gov), Customs Bulletin and Decisions, Federal Register, CustomsMobile, customs trade news, and any web source reporting on US tariff classification. ' +
-              'Keywords: "CBP tariff classification ruling" "CROSS ruling NY N" "HQ H ruling" "HTS classification" "smartphone" "air conditioner" "Samsung" "Apple" "LG" "US customs ruling {YEAR}". ' +
-              'For each CROSS ruling, the ruling number looks like "N123456" or "H345678" — always include it in ruling_number. ' +
+    source  : 'U.S. CIT/CAFC 판결 · 통상 분쟁 (CROSS는 API 직수집)',
+    // ※ 일상적 CROSS 결정은 CBP API로 전수 수집하므로, 여기서는 그 外 보완 영역에 집중
+    prompt  : 'Search for NOTABLE US HS tariff classification developments in the last {DAYS} days, EXCLUDING routine CBP CROSS ruling letters (those are collected separately). ' +
+              'Focus on: Court of International Trade (CIT) and Federal Circuit (CAFC) classification judgments, classification disputes/litigation, Section 301/exclusion classification issues, and trade-press analysis of significant US classification decisions. ' +
+              'Look in: cit.uscourts.gov, cafc.uscourts.gov, Sandler Travis, law firm trade alerts, Lexology, Law360. ' +
+              'Keywords: "CIT tariff classification decision" "CAFC classification HTSUS" "classification litigation" "smartphone" "air conditioner" "Samsung" "Apple" "LG" "{YEAR}". ' +
               'Do NOT limit results to official DB only — news articles and trade reports are acceptable.'
   },
   {
@@ -524,6 +565,23 @@ function runHSRulingMonitor() {
   var responses = _fetchAllInBatches(requests);
 
   var allResults = [];
+
+  // ── 공식 API 직접 수집 (하이브리드) — 영구 원문 URL + 대량 수집 ──
+  if (USE_CBP_API) {
+    try {
+      var cbp = _collectCbpRulings(periodStart);
+      allResults.push.apply(allResults, cbp);
+      Logger.log('[CBP CROSS API] ' + cbp.length + '건 수집');
+    } catch (e) { Logger.log('[CBP CROSS API] 오류: ' + e.message); }
+  }
+  if (USE_FEDERAL_REGISTER) {
+    try {
+      var fr = _collectFederalRegister(periodStart);
+      allResults.push.apply(allResults, fr);
+      Logger.log('[Federal Register API] ' + fr.length + '건 수집');
+    } catch (e) { Logger.log('[Federal Register API] 오류: ' + e.message); }
+  }
+
   responses.forEach(function(resp, i) {
     var region = MONITORING_REGIONS[i];
     if (!resp) { Logger.log('[' + region.region + '] 응답 없음(재시도 실패)'); return; }
@@ -608,6 +666,153 @@ function _fetchAllInBatches(requests) {
   return responses;
 }
 
+// ─── 공식 API 직접 수집 (CBP CROSS / Federal Register) ───────────────────────
+
+/**
+ * 美 CBP CROSS 분류 결정 직접 수집.
+ * 검색어별로 rulings.cbp.gov/api/search 를 최신순 호출 → 기간 내 분류(Tariff Classification) 결정만 채택.
+ * 원문 URL은 rulings.cbp.gov/ruling/{번호} 형태의 영구 canonical URL.
+ * ※ CBP API 응답 필드명은 변동 가능 → 여러 후보 필드명을 폴백 처리. testCbpApi()로 실제 구조 확인 가능.
+ */
+function _collectCbpRulings(periodStart) {
+  var reqs = CBP_SEARCH_TERMS.map(function(term) {
+    return {
+      url: 'https://rulings.cbp.gov/api/search?term=' + encodeURIComponent(term) +
+           '&collection=ALL&sortBy=DATE_DESC&pageSize=' + CBP_PAGE_SIZE + '&page=1',
+      method: 'get', muteHttpExceptions: true,
+      headers: { 'Accept': 'application/json' }
+    };
+  });
+
+  var resps;
+  try { resps = UrlFetchApp.fetchAll(reqs); }
+  catch (e) { Logger.log('[CBP] fetchAll 오류: ' + e.message); return []; }
+
+  var bySeen = {};   // ruling number 기준 중복 제거 (검색어 간)
+  var out    = [];
+
+  resps.forEach(function(resp, ti) {
+    if (!resp || resp.getResponseCode() !== 200) {
+      Logger.log('[CBP] "' + CBP_SEARCH_TERMS[ti] + '" HTTP ' + (resp ? resp.getResponseCode() : '없음'));
+      return;
+    }
+    var data;
+    try { data = JSON.parse(resp.getContentText()); } catch (e) { return; }
+    var rulings = data.rulings || data.results || data.Rulings || (data.data && data.data.rulings) || [];
+    var kept = 0;
+
+    rulings.forEach(function(r) {
+      if (kept >= CBP_MAX_PER_TERM) return;
+      var num  = r.rulingNumber || r.ruling_number || r.number || r.RulingNumber || '';
+      if (!num || bySeen[num]) return;
+
+      var dateStr = r.rulingDate || r.date || r.publicationDate || r.RulingDate || '';
+      var d = dateStr ? new Date(dateStr) : null;
+      if (d && !isNaN(d.getTime()) && d < periodStart) return;  // 기간 밖
+
+      // 분류(Tariff Classification) 결정만 — HS 한정
+      var cat = String(r.category || r.rulingType || r.type || '').toLowerCase();
+      if (cat && cat.indexOf('class') === -1) return;
+
+      var tariffs = r.tariffs || r.tariff || r.htsNumbers || r.htsnumbers || [];
+      if (!Array.isArray(tariffs)) tariffs = tariffs ? [tariffs] : [];
+      var hs = tariffs.length ? String(tariffs[0]) : '';
+      var subject = r.subject || r.title || r.rulingReference || r.description || '';
+
+      bySeen[num] = true;
+      kept++;
+
+      var item = {
+        category       : '북미',
+        country        : '미국',
+        source         : 'U.S. CBP CROSS',
+        ruling_number  : String(num).trim(),
+        hs_code        : hs,
+        product_name   : '',
+        product_name_en: '',
+        company        : _detectCompany(subject),
+        title          : '',
+        title_en       : subject,
+        summary        : '품목분류 결정' + (tariffs.length ? ' (HTS ' + tariffs.join(', ') + ')' : ''),
+        issue_date     : (d && !isNaN(d.getTime())) ? _fmtDate(d) : String(dateStr).substring(0, 10),
+        url            : 'https://rulings.cbp.gov/ruling/' + encodeURIComponent(String(num).trim()),
+        url_source     : 'CBP CROSS',
+        url_status     : 'OK(API)'   // 공식 API 영구 URL — 접속 검증 생략
+      };
+      item.importance = _autoImportance(item);
+      out.push(item);
+    });
+  });
+  return out;
+}
+
+/**
+ * 美 Federal Register 직접 수집 (무인증 JSON API).
+ * CBP가 발행하는 분류 관련 고시/결정(Customs Bulletin 등)을 영구 html_url과 함께 수집.
+ */
+function _collectFederalRegister(periodStart) {
+  var url = 'https://www.federalregister.gov/api/v1/documents.json' +
+    '?per_page=80&order=newest' +
+    '&conditions[term]=' + encodeURIComponent('tariff classification') +
+    '&conditions[agencies][]=u-s-customs-and-border-protection' +
+    '&conditions[publication_date][gte]=' + _fmtDate(periodStart) +
+    '&fields[]=title&fields[]=html_url&fields[]=publication_date&fields[]=abstract&fields[]=document_number';
+
+  var resp;
+  try { resp = UrlFetchApp.fetch(url, { method: 'get', muteHttpExceptions: true }); }
+  catch (e) { Logger.log('[FedReg] fetch 오류: ' + e.message); return []; }
+  if (resp.getResponseCode() !== 200) {
+    Logger.log('[FedReg] HTTP ' + resp.getResponseCode());
+    return [];
+  }
+  var data;
+  try { data = JSON.parse(resp.getContentText()); } catch (e) { return []; }
+
+  return (data.results || []).map(function(r) {
+    var title = r.title || '';
+    var item = {
+      category       : '북미',
+      country        : '미국',
+      source         : 'U.S. Federal Register (CBP)',
+      ruling_number  : r.document_number || '',
+      hs_code        : '',
+      product_name   : '',
+      product_name_en: '',
+      company        : _detectCompany(title + ' ' + (r.abstract || '')),
+      title          : '',
+      title_en       : title,
+      summary        : String(r.abstract || '품목분류 관련 고시/결정').substring(0, 300),
+      issue_date     : r.publication_date || '',
+      url            : r.html_url || '',
+      url_source     : 'Federal Register',
+      url_status     : r.html_url ? 'OK(API)' : ''
+    };
+    item.importance = _autoImportance(item);
+    return item;
+  });
+}
+
+/** 텍스트에서 모니터링 기업명 탐지 (API 항목은 기업 필드가 없으므로 제목/요약에서 추출) */
+function _detectCompany(text) {
+  var low = String(text || '').toLowerCase();
+  var names = { 'apple': 'Apple', 'samsung': 'Samsung', 'lg electronics': 'LG Electronics',
+                'huawei': 'Huawei', 'xiaomi': 'Xiaomi', 'oppo': 'Oppo', 'vivo': 'Vivo',
+                'whirlpool': 'Whirlpool', 'haier': 'Haier' };
+  var found = '';
+  Object.keys(names).forEach(function(k) { if (!found && low.indexOf(k) !== -1) found = names[k]; });
+  return found;
+}
+
+/** 모델 판정 없는 API 항목의 중요도 자동 산정 (상=기업 직접 / 중=품목 / 하=HS류) */
+function _autoImportance(item) {
+  var hay = (String(item.title_en || '') + ' ' + String(item.summary || '') + ' ' +
+             String(item.product_name_en || '')).toLowerCase();
+  if (item.company) return '상';
+  if (MONITORED_COMPANIES.some(function(c) { return hay.indexOf(c) !== -1; })) return '상';
+  if (MONITORED_PRODUCT_TERMS.some(function(p) { return hay.indexOf(p) !== -1; })) return '중';
+  return '하';
+}
+
 // ─── 중복 제거 ───────────────────────────────────────────────────────────────
 
 function _itemKeys(item) {
@@ -665,31 +870,58 @@ function _dedupResults(results) {
 function _verifyItemUrls(items) {
   var targets = [];
   items.forEach(function(it) {
-    if (!it.url) { it.url_status = ''; return; }
+    if (String(it.url_status || '').indexOf('OK(API)') !== -1) return;  // 공식 API URL은 검증 불필요
+    if (!it.url) { it.url_status = it.url_status || ''; return; }
     if (!/^https?:\/\//i.test(it.url)) { it.url = ''; it.url_status = 'FAIL(형식)'; return; }
     if (targets.length < URL_VERIFY_MAX) targets.push(it);
     else it.url_status = 'SKIP';
   });
-  if (!targets.length) return;
 
-  var reqs = targets.map(function(it) {
-    return { url: it.url, method: 'get', muteHttpExceptions: true,
-             followRedirects: true, validateHttpsCertificates: false };
+  targets.forEach(function(it) {
+    var resolved = _resolveFinalUrl(it.url);
+    if (resolved.finalUrl && /^https?:\/\//i.test(resolved.finalUrl)) {
+      it.url = resolved.finalUrl;   // 그라운딩 임시 리다이렉트 → 영구 canonical URL로 치환
+    }
+    it.url_status = resolved.status;
   });
+}
+
+/**
+ * URL을 수동으로 리다이렉트 추적해 ① 최종 도착 URL(canonical) ② 접속 상태를 반환.
+ * Gemini 그라운딩의 vertexaisearch 리다이렉트 URL은 임시(만료)이므로,
+ * 최종 도착 URL을 잡아 저장해야 동향DB 아카이브 링크가 나중에도 살아 있다.
+ * @returns {{ finalUrl: string, status: string }}
+ */
+function _resolveFinalUrl(url) {
+  var current = url, finalUrl = url, status = 'SKIP';
   try {
-    var resps = UrlFetchApp.fetchAll(reqs);
-    resps.forEach(function(r, i) {
-      var c = r.getResponseCode();
-      if ((c >= 200 && c < 400) || c === 401 || c === 403 || c === 405 || c === 429) {
-        targets[i].url_status = 'OK';
-      } else {
-        targets[i].url_status = 'FAIL(' + c + ')';
+    for (var hop = 0; hop < 5; hop++) {
+      var resp = UrlFetchApp.fetch(current, {
+        method: 'get', muteHttpExceptions: true,
+        followRedirects: false, validateHttpsCertificates: false
+      });
+      var c = resp.getResponseCode();
+      if (c >= 300 && c < 400) {
+        var loc = resp.getAllHeaders()['Location'] || resp.getAllHeaders()['location'] || '';
+        if (Array.isArray(loc)) loc = loc[0];
+        if (!loc) { status = 'OK'; break; }
+        // 상대경로 보정
+        if (/^https?:\/\//i.test(loc)) { current = loc; }
+        else { current = current.replace(/^(https?:\/\/[^\/]+).*$/, '$1') + (loc.charAt(0) === '/' ? '' : '/') + loc; }
+        finalUrl = current;
+        continue;
       }
-    });
+      if ((c >= 200 && c < 300) || c === 401 || c === 403 || c === 405 || c === 429) {
+        finalUrl = current; status = 'OK';
+      } else {
+        status = 'FAIL(' + c + ')';
+      }
+      break;
+    }
   } catch (e) {
-    Logger.log('[verifyUrls] 검증 오류(링크는 유지): ' + e.message);
-    targets.forEach(function(it) { if (!it.url_status) it.url_status = 'SKIP'; });
+    status = 'SKIP';
   }
+  return { finalUrl: finalUrl, status: status };
 }
 
 // ─── "HS 요청" 메일 수신 감지 및 자동 재발송 ─────────────────────────────────
@@ -1393,6 +1625,38 @@ function listAvailableModels() {
     if ((m.supportedGenerationMethods || []).indexOf('generateContent') !== -1) {
       Logger.log(m.name + '  —  ' + (m.displayName || ''));
     }
+  });
+}
+
+/**
+ * CBP CROSS API 실제 응답 구조 확인용 — 최초 설정 시 1회 실행 권장.
+ * 응답 필드명(rulingNumber/subject/tariffs/rulingDate/category 등)이 다르면
+ * 로그를 보고 _collectCbpRulings의 폴백 필드명을 조정하세요.
+ */
+function testCbpApi() {
+  var resp = UrlFetchApp.fetch(
+    'https://rulings.cbp.gov/api/search?term=smartphone&collection=ALL&sortBy=DATE_DESC&pageSize=3&page=1',
+    { method: 'get', muteHttpExceptions: true, headers: { 'Accept': 'application/json' } }
+  );
+  Logger.log('[testCbpApi] HTTP ' + resp.getResponseCode());
+  var body = resp.getContentText();
+  Logger.log('[testCbpApi] 최상위 키: ' + Object.keys(JSON.parse(body || '{}')).join(', '));
+  Logger.log(body.substring(0, 2500));
+
+  var items = _collectCbpRulings(new Date(Date.now() - 365 * 24 * 60 * 60 * 1000));
+  Logger.log('[testCbpApi] 파싱 결과 ' + items.length + '건 (최근 1년 smartphone 외 전체 검색어)');
+  items.slice(0, 5).forEach(function(it) {
+    Logger.log('  - [' + it.ruling_number + '] ' + it.title_en + ' | HS ' + (it.hs_code || '-') +
+               ' | ' + it.issue_date + ' | ' + it.url);
+  });
+}
+
+/** Federal Register API 응답 구조 확인용 */
+function testFederalRegister() {
+  var items = _collectFederalRegister(new Date(Date.now() - 90 * 24 * 60 * 60 * 1000));
+  Logger.log('[testFederalRegister] ' + items.length + '건');
+  items.slice(0, 5).forEach(function(it) {
+    Logger.log('  - ' + it.title_en + ' | ' + it.issue_date + ' | ' + it.url);
   });
 }
 
