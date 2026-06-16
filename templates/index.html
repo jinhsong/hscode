@@ -51,18 +51,26 @@
     let lastResults = [];
 
     function cell(c) {
-      // c: {match_type, matched_model, cert_num, product_name, maker}
-      if (!c.match_type) {
-        const note = c.product_name && c.product_name.startsWith("(") ? c.product_name : "";
-        return `<span class="no">미확인</span> <div class="sub">${note}</div>`;
+      // c: {status, match_type, matched_model, cert_num, product_name, maker, detail_url, message}
+      if (c.status === "error") {
+        return `<span class="warn">⚠️ 조회실패</span><div class="sub">${c.message||''}</div>`;
       }
+      if (c.status === "skipped") {
+        return `<span class="sub">설정필요</span><div class="sub">${c.message||''}</div>`;
+      }
+      if (c.status === "not_found") {
+        return `<span class="no">인증 없음</span>`;
+      }
+      // certified | review
       const label = c.match_type === "exact" ? '<span class="ok">인증됨</span>'
                   : c.match_type === "prefix" ? '<span class="ok">인증됨</span> <span class="badge">basic 매칭</span>'
                   : '<span class="warn">유사(확인필요)</span>';
+      const link = c.detail_url
+        ? `<br><a href="${c.detail_url}" target="_blank" rel="noopener">공식 원본 확인 ↗</a>` : "";
       return `${label}
         <div class="sub">모델: <b>${c.matched_model||''}</b><br>
         인증번호: ${c.cert_num||'-'}<br>
-        ${c.product_name||''} ${c.maker?('· '+c.maker):''}</div>`;
+        ${c.product_name||''} ${c.maker?('· '+c.maker):''}${link}</div>`;
     }
 
     function render(results) {
@@ -104,11 +112,11 @@
 
     $("#export").addEventListener("click", (e) => {
       e.preventDefault();
-      const rows = [["full_code","KC_결과","KC_모델","KC_인증번호","전파_결과","전파_모델","전파_인증번호"]];
+      const rows = [["full_code","KC_상태","KC_모델","KC_인증번호","전파_상태","전파_모델","전파_인증번호"]];
       for (const r of lastResults) {
         rows.push([r.full_code,
-          r.kc.match_type||"미확인", r.kc.matched_model||"", r.kc.cert_num||"",
-          r.rra.match_type||"미확인", r.rra.matched_model||"", r.rra.cert_num||""]);
+          r.kc.status, r.kc.matched_model||"", r.kc.cert_num||"",
+          r.rra.status, r.rra.matched_model||"", r.rra.cert_num||""]);
       }
       const csv = rows.map(r => r.map(v => `"${(v+"").replace(/"/g,'""')}"`).join(",")).join("\n");
       const blob = new Blob(["﻿"+csv], { type: "text/csv;charset=utf-8" });

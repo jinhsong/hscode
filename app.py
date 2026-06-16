@@ -65,4 +65,8 @@ def api_check():
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    import os
+    host = os.environ.get("HOST", "127.0.0.1")  # 컨테이너에선 0.0.0.0 으로
+    port = int(os.environ.get("PORT", "5000"))
+    debug = os.environ.get("DEBUG", "1") == "1"
+    app.run(host=host, port=port, debug=debug)
