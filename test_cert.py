@@ -3,6 +3,29 @@
 import cert_client
 from cert_client import check_model, ENDPOINTS, check_one
 
+# 네트워크 없이 내장 샘플로 검증 (KC/전파 모두 데모 강제)
+cert_client.FORCE_DEMO = True
+
+
+def test_emsit_xml_parse():
+    # 공식 문서의 getAuthInfo 샘플 응답 형태를 파싱할 수 있어야 함
+    xml = """<GetAuthInfoResponse>
+        <bsmNm>(주)OO기술</bsmNm><mtlNm>SSD</mtlNm>
+        <matlBscMdlNm>MITS3016GN1-S</matlBscMdlNm>
+        <matlDerivMdlNm>MITS3002GN1-S,MITS3004GN1-S</matlDerivMdlNm>
+        <mtlCefNo>KCC-REM-MJT-MJT</mtlCefNo>
+        <matlMfrNm>(주)OO기술</matlMfrNm>
+        <resultCode>0000</resultCode></GetAuthInfoResponse>"""
+    recs = cert_client._parse_emsit_xml(xml)
+    assert len(recs) == 1
+    assert recs[0]["matlBscMdlNm"] == "MITS3016GN1-S"
+    assert recs[0]["mtlCefNo"] == "KCC-REM-MJT-MJT"
+
+
+def test_emsit_xml_no_result():
+    xml = "<GetAuthInfoResponse><resultCode>0001</resultCode></GetAuthInfoResponse>"
+    assert cert_client._parse_emsit_xml(xml) == []
+
 
 def test_demo_certified_basic():
     r = check_model("SM-X300akak")

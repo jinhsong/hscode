@@ -28,10 +28,13 @@
 </head>
 <body>
   <h1>수입모델 인증 확인 · KC 안전인증 / 전파인증</h1>
-  {% if demo %}
-  <div class="demo">⚠️ <b>데모 모드</b>입니다 (DATA_GO_KR_SERVICE_KEY 미설정).
-    내장 샘플 DB로 매칭만 시연합니다. 예: <code>SM-X300akak</code>, <code>SM-X306abc</code>,
-    <code>SM-S921xyz</code>, <code>SM-A999zzz</code> 를 넣어보세요.</div>
+  {% if demo_kc or demo_rra %}
+  <div class="demo">
+    {% if demo_rra %}⚠️ <b>전파인증: 데모</b> (RRA_API_URL 미설정 — 샘플값){% else %}✅ <b>전파인증: 실제 조회</b> (EMSIT, 키 불필요){% endif %} ·
+    {% if demo_kc %}⚠️ <b>KC 안전인증: 데모</b> (DATA_GO_KR_SERVICE_KEY 미설정 — 샘플값){% else %}✅ <b>KC 안전인증: 실제 조회</b>{% endif %}
+    <br>데모 항목은 내장 샘플로 시연됩니다. 예: <code>SM-X300akak</code>, <code>SM-X306abc</code>,
+    <code>SM-S921xyz</code>, <code>SM-A999zzz</code>
+  </div>
   {% endif %}
 
   <p>모델 full code 를 한 줄에 하나씩 입력하거나 CSV 파일을 올리세요.</p>

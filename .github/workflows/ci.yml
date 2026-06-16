@@ -23,6 +23,8 @@ jobs:
       - name: Compile check
         run: python -m compileall -q app.py cert_client.py demo_data.py
       - name: Run tests
+        env:
+          FORCE_DEMO: "1"   # 외부 API 호출 없이 내장 샘플로 검증
         run: |
           python test_matching.py
           python test_cert.py

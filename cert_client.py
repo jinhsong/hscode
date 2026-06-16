@@ -2,8 +2,8 @@
 인증 조회 클라이언트 + 코드 매칭 로직.
 
 수입 모델의 full code(예: SM-X300akak)가
-  1) KC 전기용품 안전인증
-  2) 전파인증(방송통신기자재 적합성평가)
+  1) KC 전기용품 안전인증            (data.go.kr, 인증키 필요)
+  2) 전파인증(방송통신기자재 적합성평가)  (EMSIT Open API, 키 불필요)
 를 받았는지, 인증 DB에 등록된 basic code / derivative code 와 비교해서 판정한다.
 
 핵심:
@@ -12,9 +12,9 @@
   같이 보고 신뢰도를 함께 반환한다.
 - 컴플라이언스 도구이므로 '조회 실패(error)'와 '인증 없음(not_found)'을 명확히 구분한다.
 
-※ 두 Open API 의 정확한 엔드포인트 URL / 파라미터 이름은 공공데이터포털 '활용신청' 후
-  상세 페이지의 '요청주소(End Point)'와 '요청변수(Request Parameter)'에서 확정해야 한다.
-  아래 ENDPOINTS 딕셔너리만 수정하면 된다.
+소스별 드라이버:
+- rra(전파): EMSIT getAuthInfo.do — 키 없이 matlBscMdlNm/matlDerivMdlNm 로 검색, XML 응답.
+- kc       : 공공데이터포털(data.go.kr) — serviceKey 필요, JSON 응답.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, asdict
 from typing import Optional
@@ -39,46 +40,66 @@ except Exception:
 # 설정
 # ---------------------------------------------------------------------------
 
-# 공공데이터포털(data.go.kr) 일반 인증키. RRA / KATS 데이터 모두 동일 키로 호출된다.
+# 공공데이터포털(data.go.kr) 일반 인증키. KC 데이터 조회에 사용.
 SERVICE_KEY = os.environ.get("DATA_GO_KR_SERVICE_KEY", "")
 
+# 테스트/오프라인에서 실제 네트워크 호출 없이 내장 샘플로 강제 동작.
+FORCE_DEMO = os.environ.get("FORCE_DEMO", "") == "1"
+
 # prefix 매칭 오탐 방지: 매칭에 쓰인 모델명(정규화)이 이 길이 미만이면 prefix 매칭 거절.
-#   예) DB에 'SM'(짧음)이 있어도 'SM-X300akak'이 거짓 인증으로 잡히지 않게.
 MIN_PREFIX_LEN = int(os.environ.get("MIN_PREFIX_LEN", "5"))
 
 # 대량 조회 시 동시 호출 수 (API rate-limit 고려해 보수적으로).
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))
 
+# 전파인증(EMSIT) 적합성평가 인증DB 정보 — 키 없이 모델명으로 조회 가능한 공개 엔드포인트.
+EMSIT_RRA_URL = "http://emsit.go.kr/openapi/service/AuthenticationInfoService/getAuthInfo.do"
+
 # 각 API의 요청주소/파라미터/응답필드.
 ENDPOINTS = {
-    # 전파인증: 국립전파연구원_적합성평가 DB정보  (data.go.kr/data/3034183)
+    # 전파인증: EMSIT getAuthInfo.do (키 불필요, XML)
     "rra": {
         "label": "전파인증(적합성평가)",
-        "url": os.environ.get("RRA_API_URL", ""),  # 예: http://apis.data.go.kr/.../getList
-        "search_param": os.environ.get("RRA_SEARCH_PARAM", "searchVal"),
-        "basic_field": "basicMdlNm",     # 기본모델명
-        "deriv_field": "drvtMdlNm",      # 파생모델명(여러 개면 콤마/슬래시 등으로 연결됨)
-        "certnum_field": "cnfmKsgsno",   # 인증/등록번호
-        "name_field": "eqpmnNm",         # 기자재명칭
-        "maker_field": "mnfctrNm",       # 제조자
-        # 공식 원본 확인 링크 ({certnum} 치환)
+        "driver": "emsit",
+        "url": os.environ.get("RRA_API_URL", EMSIT_RRA_URL),
+        "basic_param": "matlBscMdlNm",     # 기본모델로 검색
+        "deriv_param": "matlDerivMdlNm",   # 파생모델로 검색
+        "basic_field": "matlBscMdlNm",     # 응답: 기본모델
+        "deriv_field": "matlDerivMdlNm",   # 응답: 파생모델(콤마 구분 CLOB)
+        "certnum_field": "mtlCefNo",       # 응답: 인증/등록번호
+        "name_field": "mtlNm",             # 응답: 기자재명칭
+        "maker_field": "matlMfrNm",        # 응답: 제조자
         "detail_url_tmpl": "https://www.rra.go.kr/ko/license/A_b_popup_keyno.do?key_no={certnum}",
     },
     # KC 안전인증: 국가기술표준원_제품 안전인증 및 리콜 정보 (data.go.kr/data/15116894)
     "kc": {
         "label": "KC 안전인증",
+        "driver": "datagokr",
         "url": os.environ.get("KC_API_URL", ""),
         "search_param": os.environ.get("KC_SEARCH_PARAM", "modelNm"),
-        "basic_field": "modelNm",        # 모델명
-        "deriv_field": "",               # KC 데이터엔 파생모델 컬럼이 별도로 없을 수 있음
-        "certnum_field": "certNum",      # 인증번호
-        "name_field": "productNm",       # 제품명
-        "maker_field": "makerNm",        # 제조사
+        "basic_field": "modelNm",          # 모델명
+        "deriv_field": "",                 # KC 데이터엔 파생모델 컬럼이 별도로 없을 수 있음
+        "certnum_field": "certNum",        # 인증번호
+        "name_field": "productNm",         # 제품명
+        "maker_field": "makerNm",          # 제조사
         "detail_url_tmpl": "https://www.safetykorea.kr/release/certDetail?certNum={certnum}",
     },
 }
 
-DEMO_MODE = not SERVICE_KEY  # 키 없으면 demo_data 로 동작
+
+def is_demo(kind: str) -> bool:
+    """소스별 데모 여부. 전파(rra)는 키 없이도 실조회되므로 URL만 있으면 실모드."""
+    if FORCE_DEMO:
+        return True
+    if kind == "kc":
+        return not (SERVICE_KEY and ENDPOINTS["kc"]["url"])
+    if kind == "rra":
+        return not ENDPOINTS["rra"]["url"]
+    return True
+
+
+# 화면 배너용: 하나라도 데모면 True
+DEMO_MODE = is_demo("kc") or is_demo("rra")
 
 
 # ---------------------------------------------------------------------------
@@ -147,9 +168,8 @@ def _build_search_terms(full_code: str, min_len: int = MIN_PREFIX_LEN) -> list[s
             terms.append(t)
 
     add(full_code)
-    add(re.sub(r"[a-z]+$", "", full_code))      # 뒤쪽 소문자 접미 제거 (akak)
-    add(re.sub(r"[A-Za-z]+$", "", full_code))    # 뒤쪽 영문 접미 제거 (N, KOR)
-    # 그래도 길면 한 글자씩 줄인 접두 후보 (너무 짧아지면 중단)
+    add(re.sub(r"[a-z]+$", "", full_code))       # 뒤쪽 소문자 접미 제거 (akak)
+    add(re.sub(r"[A-Za-z]+$", "", full_code))     # 뒤쪽 영문 접미 제거 (N, KOR)
     core = re.sub(r"[^A-Za-z0-9]", "", full_code)
     while len(core) > min_len and len(terms) < 4:
         core = core[:-1]
@@ -196,15 +216,66 @@ def _http_search(cfg: dict, search_value: str, num_rows: int = 100, max_pages: i
     return items
 
 
+def _parse_emsit_xml(text: str) -> list[dict]:
+    """
+    EMSIT getAuthInfo XML 응답을 dict 레코드 리스트로 파싱.
+    단건/다건 모두 처리하고, resultCode 0001(조회내역없음)은 빈 결과로 본다.
+      <GetAuthInfoResponse>
+        <matlBscMdlNm>...</matlBscMdlNm><matlDerivMdlNm>...</matlDerivMdlNm>
+        <mtlCefNo>...</mtlCefNo> ... <resultCode>0000</resultCode>
+      </GetAuthInfoResponse>
+    """
+    try:
+        root = ET.fromstring(text.strip())
+    except ET.ParseError:
+        return []
+
+    nodes = []
+    if root.find("matlBscMdlNm") is not None or root.find("mtlCefNo") is not None:
+        nodes.append(root)
+    nodes += root.findall(".//GetAuthInfoResponse")
+    nodes += root.findall(".//item")
+
+    records, seen = [], set()
+    for node in nodes:
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        rec = {child.tag: (child.text or "").strip() for child in node}
+        if rec.get("resultCode") == "0001":
+            continue
+        if rec.get("matlBscMdlNm") or rec.get("mtlCefNo"):
+            records.append(rec)
+    return records
+
+
+def _emsit_search(cfg: dict, term: str) -> list[dict]:
+    """EMSIT getAuthInfo 를 기본모델/파생모델 파라미터로 각각 조회해 합친다(인증번호로 중복 제거)."""
+    records: list[dict] = []
+    seen = set()
+    for param in (cfg["basic_param"], cfg["deriv_param"]):
+        resp = requests.get(cfg["url"], params={param: term}, timeout=15)
+        resp.raise_for_status()
+        for rec in _parse_emsit_xml(resp.text):
+            key = rec.get("mtlCefNo") or repr(sorted(rec.items()))
+            if key in seen:
+                continue
+            seen.add(key)
+            records.append(rec)
+    return records
+
+
 def _search(kind: str, cfg: dict, term: str) -> list[dict]:
-    """검색 결과를 캐시와 함께 반환 (데모/실 API 공용)."""
+    """검색 결과를 캐시와 함께 반환 (데모/EMSIT/data.go.kr 공용)."""
     key = (kind, term.upper())
     with _CACHE_LOCK:
         if key in _CACHE:
             return _CACHE[key]
-    if DEMO_MODE:
+    if is_demo(kind):
         import demo_data
         items = demo_data.search(kind, term)
+    elif cfg.get("driver") == "emsit":
+        items = _emsit_search(cfg, term)
     else:
         items = _http_search(cfg, term)
     with _CACHE_LOCK:
@@ -237,7 +308,7 @@ def check_one(full_code: str, cfg: dict, kind: str) -> MatchResult:
     """단일 인증(cfg)에 대해 full_code 조회. kind: 'kc' | 'rra'"""
     result = MatchResult(full_code=full_code)
 
-    if not DEMO_MODE and not cfg.get("url"):
+    if not is_demo(kind) and not cfg.get("url"):
         result.status = "skipped"
         result.message = "API URL 미설정"
         return result

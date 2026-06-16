@@ -35,7 +35,11 @@ def _parse_codes_from_text(text: str) -> list[str]:
 
 @app.route("/")
 def index():
-    return render_template("index.html", demo=cert_client.DEMO_MODE)
+    return render_template(
+        "index.html",
+        demo_kc=cert_client.is_demo("kc"),
+        demo_rra=cert_client.is_demo("rra"),
+    )
 
 
 @app.route("/api/check", methods=["POST"])
