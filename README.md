@@ -18,6 +18,19 @@
 | `reverse_prefix` | full code 가 인증 모델의 접두 (약한 매칭, 확인필요) | 참고용 |
 
 하이픈/공백 차이는 무시하고 비교합니다(`SM-X300` = `SMX300`).
+오탐 방지를 위해 `prefix` 매칭은 매칭 길이가 `MIN_PREFIX_LEN`(기본 5) 이상일 때만 인정합니다.
+
+### 결과 상태 (status)
+
+컴플라이언스 도구이므로 **"조회 실패"와 "인증 없음"을 명확히 구분**합니다.
+
+| status | 의미 |
+|---|---|
+| `certified` | 인증 확인됨 (exact/prefix) — 공식 원본 확인 링크 제공 |
+| `review` | 유사 매칭(reverse_prefix), 사람이 확인 필요 |
+| `not_found` | 조회 성공했으나 인증 없음 |
+| `error` | ⚠️ API 오류로 **확인 불가** (인증 없음으로 단정 금지) |
+| `skipped` | API URL 미설정 |
 
 ## 빠른 시작 (데모 모드)
 
@@ -71,7 +84,16 @@ SM-A999zzz    → 둘 다 ✗
 | `cert_client.py` | API 호출 + **코드 매칭 로직** (핵심) |
 | `demo_data.py` | 키 없을 때 쓰는 샘플 DB |
 | `templates/index.html` | 화면 |
-| `test_matching.py` | 매칭 로직 테스트 (`python test_matching.py`) |
+| `test_matching.py` | 매칭/검색 로직 테스트 (`python test_matching.py`) |
+| `test_cert.py` | 상태 판정 · Flask 계층 테스트 (`python test_cert.py`) |
+| `Dockerfile` / `.github/workflows/ci.yml` | 컨테이너 빌드 · CI |
+
+## Docker
+
+```bash
+docker build -t hscode .
+docker run -p 5000:5000 --env-file .env hscode   # http://127.0.0.1:5000
+```
 
 ## 참고
 

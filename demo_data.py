@@ -41,15 +41,21 @@ KC_DB = [
 ]
 
 
+def _norm(s: str) -> str:
+    return s.upper().replace("-", "").replace(" ", "")
+
+
 def search(kind: str, term: str) -> list[dict]:
-    """term 을 포함(대소문자 무시)하는 레코드 반환 — 실제 API 검색을 흉내."""
+    """term 과 (부분/접두) 일치하는 레코드 반환 — 실제 API 검색을 흉내."""
     db = RRA_DB if kind == "rra" else KC_DB
     field = "basicMdlNm" if kind == "rra" else "modelNm"
-    t = term.upper().replace("-", "")
+    t = _norm(term)
     hits = []
     for row in db:
-        hay = (row.get(field, "") + " " + row.get("drvtMdlNm", "")).upper().replace("-", "")
-        if t in hay or hay.split() and any(t.startswith(x) or x.startswith(t)
-                                           for x in [row.get(field, "").upper().replace("-", "")]):
+        models = [row.get(field, "")]
+        if row.get("drvtMdlNm"):
+            models += [m.strip() for m in row["drvtMdlNm"].replace("/", ",").split(",")]
+        norms = [_norm(m) for m in models if m]
+        if any(t in m or m.startswith(t) or t.startswith(m) for m in norms):
             hits.append(row)
     return hits
