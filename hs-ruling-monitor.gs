@@ -2,6 +2,41 @@
  * HS Code 유권해석(Ruling) 주간 모니터링 시스템
  * ─────────────────────────────────────────────
  * [변경 이력]
+ * v4.3 (코드 리뷰 반영 — 버그/성능/보안/가독성 전면 수정)
+ *  - [성능/핵심] 6분 실행제한으로 인한 전체 유실 방지:
+ *      · 시간예산(EXEC_BUDGET_MS) 도입 — 재시도/URL검증이 예산을 넘기면 조기 중단하고
+ *        저장(_saveToSheet)·발송(_sendEmail)은 항상 실행되도록 파이프라인 재구성
+ *      · URL 검증을 항목별 순차 리다이렉트 추적(최대 300회 순차 호출)에서 라운드 단위
+ *        UrlFetchApp.fetchAll() 배치 처리(O(홉수) 호출)로 재작성
+ *      · Gemini 재시도: 대량 실패(과반) 시 재시도 자체를 생략(모델명/쿼터 문제로 판단),
+ *        재시도 루프도 시간예산 확인 후 조기 종료
+ *      · CBP CROSS 수집도 배치+재시도 재사용(_fetchAllInBatches)으로 전환 — 조용히 0건 되는 문제 완화
+ *  - [핵심] EU 직수집 결과가 스코프 필터에 전부 걸려 0건 처리되던 문제 수정:
+ *      공식 API/DB 직수집 항목(provenance='공식')은 수집 시점에 명시적으로 태깅하고
+ *      스코프 필터를 건너뛰도록 변경 (기존엔 출처 문자열 정규식으로 provenance를 추론해
+ *      EU Gemini 패스까지 '공식'으로 오분류되던 문제도 함께 해결)
+ *  - [버그] 한국어 등 현지어 전용 Gemini 결과가 영어 키워드만으로 스코프 매칭에서 탈락하던 문제 수정
+ *      (MONITORED_COMPANIES_LOCAL / MONITORED_PRODUCT_TERMS_LOCAL 추가)
+ *  - [버그] 중복 제거 오탐 수정: ruling_number가 있으면 그것만으로 판정(N-키 단독) —
+ *      제목이 정형화된 문구라 서로 다른 번호의 룰링이 영문제목 접두어로 오탐 제거되던 문제 해결.
+ *      번호가 없는 항목은 국가+HS코드+게시일+한글제목 복합키를 추가해 dedup 우회 방지
+ *  - [버그] 재발송(_loadLastReportData)이 시트의 Date 객체 참조비교(===) 실패로 1건만 반환하던 문제 수정
+ *  - [버그] 오래된 룰링 제외(STALE_RULING_MONTHS) 필터가 "과거 발행·신규 보도 허용" 프롬프트 지시와
+ *      모순되어 정상 수집분을 제외하던 문제 — 필터 제거
+ *  - [버그] isGroup 지역 country 필드에 복합 국가 라벨이 그대로 반향되던 문제 수정 —
+ *      템플릿 시딩값을 단일 국가 예시로 변경 + 런타임에 countries 목록과 대조해 보정
+ *  - [버그] 중요도 '상'의 미검증 예외가 company 필드 유무에 따라 경로별로 다르게 동작하던 문제 수정
+ *      (모델 루브릭상 '상' 자체가 이미 요건을 충족하므로 company 재확인 제거)
+ *  - [보안] GEMINI_API_KEY를 URL 쿼리스트링(?key=) 대신 x-goog-api-key 헤더로 전달
+ *  - [보안] URL 리다이렉트 추적 시 validateHttpsCertificates:false(TLS 검증 비활성) 제거
+ *  - [보안] "HS 요청" 자동 재발송 시 발신자를 수신자 화이트리스트와 재대조 후 발송
+ *      (스푸핑된 From 또는 화이트리스트 스레드에 끼어든 제3자에게 발송되던 문제 차단)
+ *  - [가독성] 회사 목록을 COMPANY_DISPLAY_NAMES 단일 소스로 통합 (General Electric 누락 버그 수정)
+ *  - [가독성] 이메일 CATEGORY_ORDER를 MONITORING_REGIONS에서 자동 파생 — 카테고리 누락 버그 클래스 원천 차단
+ *  - [가독성] url_status 매직스트링 'OK(API)'를 URL_STATUS_OFFICIAL 상수로 통일
+ *  - _fetchAllInBatches 재시도 시 UrlFetchApp.fetch(url, paramsWithUrlKey) 오작동 가능성 수정
+ *    (payload 객체에서 url 키를 제외하고 전달)
+ *
  * v4.2 (정확성·필터 레이어 + EU 직수집 강화)
  *  - [정확성] 수집·검증 후 정확성/필터 레이어(_refineResults) 신설:
  *      · 스코프 필터(_scopeMatch): 회사/제품군/HS류(MONITORED_HS_CHAPTERS) 중 하나라도 매칭해야 채택 + 매칭근거 태깅
@@ -88,7 +123,22 @@ var API_BATCH_PAUSE_MS = 2000;
 var API_MAX_RETRY      = 2;     // 429/5xx 시 개별 재시도 횟수
 
 // URL 실접속 검증 최대 건수 (Apps Script 6분 실행 제한 고려)
-var URL_VERIFY_MAX = 60;
+var URL_VERIFY_MAX      = 60;
+var URL_VERIFY_MAX_HOPS = 5;      // 리다이렉트 추적 최대 홉 수 (라운드 단위 배치 처리)
+
+// ─── 실행시간 예산 (Apps Script 6분 하드 한도 대응) ──────────────────────────
+// runHSRulingMonitor() 시작 시각을 기록해두고, 검증/재시도처럼 시간이 걸리는 단계에서
+// 남은 예산을 확인해 조기 종료 → 저장(_saveToSheet)·발송(_sendEmail)은 항상 실행되도록 보장.
+var EXEC_START_MS          = null;
+var EXEC_BUDGET_MS         = 270000; // 4.5분 — 이후로는 검증/재시도를 중단하고 저장·발송으로 넘어감
+var RETRY_TIME_RESERVE_MS  = 60000;  // 재시도 단계: 남은 예산 60초 미만이면 생략
+var VERIFY_TIME_RESERVE_MS = 20000;  // URL 검증: 남은 예산 20초 미만이면 중단
+
+function _elapsedMs() { return EXEC_START_MS ? (new Date().getTime() - EXEC_START_MS) : 0; }
+function _budgetLeft() { return EXEC_BUDGET_MS - _elapsedMs(); }
+
+// url_status 매직스트링 통일 (여러 곳에서 참조 — 오타로 인한 분류 오류 방지)
+var URL_STATUS_OFFICIAL = 'OK(API)';   // 공식 API/DB 직수집 — 접속 검증 불필요, 영구 URL 보장
 
 // ─── 공식 API 직접 수집 (하이브리드) ─────────────────────────────────────────
 // API가 있는 소스는 직접 수집 → 전수에 가까운 수집 + 영구 원문 URL 확보.
@@ -101,10 +151,13 @@ var CBP_MAX_PER_TERM     = 50;     // 검색어당 기간 내 채택 상한
 var EURLEX_MAX           = 80;     // EU 분류규칙 최대 수집 건수
 
 // ─── 정확성/출처 정책 (1단계) ───────────────────────────────────────────────
-// 검증되지 않은 AI검색 항목(원문 URL 없음/접속실패)은 제외한다. 단, 회사 직접 관련 '상' 중요도는 예외로 유지.
+// 검증되지 않은 AI검색 항목(원문 URL 없음/접속실패)은 제외한다. 단, 중요도 '상'은 예외로 유지
+// (모델 루브릭상 '상'은 이미 "모니터링 기업 직접 관련" 또는 "핵심 품목 분류 변경/분쟁"을 요구하므로
+//  company 필드가 별도로 채워지지 않았다는 이유로 예외를 거부하지 않는다).
 var DROP_UNVERIFIED_AI   = true;
-// issue_date가 조회기간 시작보다 이만큼(개월) 이전이면 '오래된 룰링'으로 보고 제외 (보도 지연 감안한 여유)
-var STALE_RULING_MONTHS  = 12;
+// ※ v4.2의 STALE_RULING_MONTHS(오래된 룰링 제외) 필터는 v4.3에서 제거함 —
+//   프롬프트가 명시적으로 "발행은 과거지만 이번 기간에 새로 보도/공개된 룰링도 허용"이라 지시하는 것과
+//   정면으로 모순되어 일본 事前教示 등 공개 지연이 흔한 지역의 정상 수집 건을 잘못 제외시켰다.
 
 // CBP CROSS 검색어 — 모니터링 품목/기업 (검색어 1개 = API 1회 호출)
 var CBP_SEARCH_TERMS = [
@@ -116,8 +169,22 @@ var CBP_SEARCH_TERMS = [
 ];
 
 // ─── 자동 중요도/필터 기준 (모델 없이 수집되는 API 항목용) ───────────────────
-var MONITORED_COMPANIES = ['apple', 'samsung', 'lg electronics', 'huawei', 'xiaomi',
-                           'oppo', 'vivo', 'whirlpool', 'general electric', 'haier'];
+// 회사명은 여기 한 곳에서만 관리 (표시용 대문자 표기 ↔ 매칭용 소문자 키를 단일 소스로 통합).
+// _detectCompany()가 이 맵을 그대로 사용하므로, 여기 추가하면 검색/필터/뱃지 표시가 자동으로 일치한다.
+var COMPANY_DISPLAY_NAMES = {
+  'apple': 'Apple', 'samsung': 'Samsung', 'lg electronics': 'LG Electronics',
+  'huawei': 'Huawei', 'xiaomi': 'Xiaomi', 'oppo': 'Oppo', 'vivo': 'Vivo',
+  'whirlpool': 'Whirlpool', 'general electric': 'General Electric', 'haier': 'Haier'
+};
+var MONITORED_COMPANIES = Object.keys(COMPANY_DISPLAY_NAMES);
+
+// 한국어/현지어 Gemini 결과(특히 한국·일본·중국 등 로컬 소스)가 영어 키워드만으로는 스코프 매칭에서
+// 탈락하는 문제 보완 — _scopeMatch()에서 MONITORED_COMPANIES/PRODUCT_TERMS와 함께 사용.
+var MONITORED_COMPANIES_LOCAL = ['삼성전자', '삼성', 'lg전자', 'lg 전자', '엘지전자', '애플', '화웨이', '샤오미', '오포', '비보', '월풀', '하이얼'];
+var MONITORED_PRODUCT_TERMS_LOCAL = ['스마트폰', '휴대폰', '태블릿', '스마트워치', '이어폰', '이어버드', '헤드폰',
+  '에어컨', '히트펌프', '칠러', '오븐', '냉장고', '청소기', '텔레비전', '모니터', '사운드바', '전자칠판',
+  '에어드레서', '슈드레서', '카메라', '목업', '기지국', '안테나', '엑스레이'];
+
 var MONITORED_PRODUCT_TERMS = ['smartphone', 'mobile phone', 'cellular', 'tablet', 'smartwatch',
   'smart glass', 'earphone', 'earbud', 'headphone', 'air conditioner', 'heat pump', 'chiller',
   'oven', 'refrigerator', 'vacuum', 'television', 'tv ', 'monitor', 'soundbar', 'whiteboard',
@@ -600,6 +667,8 @@ function _saveSpreadsheetId() {
 // ─── 메인 실행 함수 ──────────────────────────────────────────────────────────
 
 function runHSRulingMonitor() {
+  EXEC_START_MS = new Date().getTime();  // 시간예산 기준점 — 검증/재시도 단계에서 남은 실행시간 확인용
+
   var props  = PropertiesService.getScriptProperties();
   var apiKey = props.getProperty('GEMINI_API_KEY');
   if (!apiKey) throw new Error('[오류] GEMINI_API_KEY가 설정되지 않았습니다.');
@@ -648,11 +717,18 @@ function runHSRulingMonitor() {
     try {
       var items = _parseGeminiResponse(resp, region.region);
       items.forEach(function(item) {
-        item.category = region.category;
+        item.category   = region.category;
+        item.provenance = 'AI검색';  // Gemini 그라운딩 결과 — 수집 시점에 명시(출처 문자열 정규식 추론 안 함)
         if (!region.isGroup) {
           item.country = region.countryName || region.region;
-        } else if (!item.country && region.countries && region.countries.length) {
-          item.country = region.countries[0];
+        } else {
+          var countries = region.countries || [];
+          var returned  = String(item.country || '').trim();
+          if (countries.length && countries.indexOf(returned) === -1) {
+            // 모델이 복합 라벨을 그대로 반향했거나 국가명을 비웠을 경우 보정
+            var matched = countries.filter(function(c) { return returned.indexOf(c) !== -1; });
+            item.country = matched.length ? matched[0] : countries[0];
+          }
         }
       });
       if (items.length > 0) {
@@ -671,17 +747,20 @@ function runHSRulingMonitor() {
   var dupCount = allResults.length - deduped.length;
   if (dupCount > 0) Logger.log('[HSRulingMonitor] 중복 ' + dupCount + '건 제외');
 
-  // 수집된 URL 실제 접속 검증 (url_status 확정 → 이후 정확성 게이팅에 사용)
-  _verifyItemUrls(deduped);
+  // 1차: 스코프(회사/제품/HS류) 필터 — 네트워크 호출 없이 먼저 걸러 URL 검증 대상을 줄인다.
+  var scoped = _scopeFilterAndTag(deduped, periodStart);
 
-  // 정확성·필터 레이어: 스코프(회사/제품/HS류) 미달·기간 외·미검증 항목 제거 + 출처유형/HS류/매칭근거 태깅
-  var refined = _refineResults(deduped, periodStart);
+  // 2차: URL 실제 접속 검증 (시간예산 내에서 라운드 배치 처리 — 예산 소진 시 조기 중단, 이후 단계는 항상 실행)
+  _verifyItemUrls(scoped);
+
+  // 3차: 미검증 AI검색 항목 제외 (검증 결과 확정 후 적용)
+  var refined = _applyUnverifiedDrop(scoped);
 
   _saveToSheet(refined, dateRangeStr);
   _sendEmail(refined, dateRangeStr, dupCount);
 
   Logger.log('[HSRulingMonitor] 완료. 발송 ' + refined.length + '건 / 수집 ' + deduped.length +
-             '건 / 중복 제외 ' + dupCount + '건.');
+             '건 / 중복 제외 ' + dupCount + '건 / 소요시간 ' + Math.round(_elapsedMs() / 1000) + '초.');
 }
 
 // ─── API 호출 배치/재시도 ────────────────────────────────────────────────────
@@ -707,16 +786,36 @@ function _fetchAllInBatches(requests) {
     if (start + API_BATCH_SIZE < requests.length) Utilities.sleep(API_BATCH_PAUSE_MS);
   }
 
-  // 실패 건 개별 재시도
+  // 실패 인덱스 수집
+  var failedIdx = [];
   for (var i = 0; i < responses.length; i++) {
     var code = responses[i] ? responses[i].getResponseCode() : 0;
     if (code === 200) continue;
     if (code !== 429 && code < 500 && responses[i]) continue; // 4xx(429 제외)는 재시도 무의미
+    failedIdx.push(i);
+  }
+
+  // 대량 실패(과반 또는 5건 초과)는 모델명 오류/쿼터 소진 등 구조적 문제로 보고 개별 재시도를 생략
+  // (재시도해도 성공 못할 요청에 10~20초씩 sleep을 쌓으면 6분 실행제한을 넘겨 그 주 수집이 전부 유실됨)
+  var massFailure = failedIdx.length > Math.max(5, Math.floor(requests.length / 2));
+  if (massFailure) {
+    Logger.log('[fetchAll] 대량 실패 감지(' + failedIdx.length + '/' + requests.length +
+               ') — 재시도 생략. MODEL_NAME 또는 API 쿼터를 확인하세요.');
+    return responses;
+  }
+
+  failedIdx.forEach(function(i) {
+    if (_budgetLeft() < RETRY_TIME_RESERVE_MS) return; // 남은 실행시간 부족 → 재시도 생략
+
+    var req    = requests[i];
+    var params = {};
+    Object.keys(req).forEach(function(k) { if (k !== 'url') params[k] = req[k]; });
 
     for (var attempt = 1; attempt <= API_MAX_RETRY; attempt++) {
+      if (_budgetLeft() < RETRY_TIME_RESERVE_MS) break;
       Utilities.sleep(Math.pow(2, attempt) * 5000); // 10초, 20초
       try {
-        var retry = UrlFetchApp.fetch(requests[i].url, requests[i]);
+        var retry = UrlFetchApp.fetch(req.url, params);
         responses[i] = retry;
         if (retry.getResponseCode() === 200) {
           Logger.log('[fetchAll] 재시도 성공 (idx ' + i + ', attempt ' + attempt + ')');
@@ -726,7 +825,7 @@ function _fetchAllInBatches(requests) {
         Logger.log('[fetchAll] 재시도 실패 (idx ' + i + '): ' + e.message);
       }
     }
-  }
+  });
   return responses;
 }
 
@@ -748,9 +847,8 @@ function _collectCbpRulings(periodStart) {
     };
   });
 
-  var resps;
-  try { resps = UrlFetchApp.fetchAll(reqs); }
-  catch (e) { Logger.log('[CBP] fetchAll 오류: ' + e.message); return []; }
+  // 배치 분할 + 429/5xx 재시도 재사용 (원래 단일 fetchAll은 재시도 없이 조용히 전체 실패했음)
+  var resps = _fetchAllInBatches(reqs);
 
   var bySeen = {};   // ruling number 기준 중복 제거 (검색어 간)
   var out    = [];
@@ -811,7 +909,8 @@ function _collectCbpRulings(periodStart) {
         issue_date     : (d && !isNaN(d.getTime())) ? _fmtDate(d) : String(dateStr).substring(0, 10),
         url            : 'https://rulings.cbp.gov/ruling/' + encodeURIComponent(String(num).trim()),
         url_source     : 'CBP CROSS',
-        url_status     : 'OK(API)'   // 공식 API 영구 URL — 접속 검증 생략
+        url_status     : URL_STATUS_OFFICIAL,  // 공식 API 영구 URL — 접속 검증 생략
+        provenance     : '공식'  // 소스텍스트 정규식 추론 대신 수집 시점에 명시 (오분류 방지)
       };
       item.importance = _autoImportance(item);
       out.push(item);
@@ -869,7 +968,8 @@ function _collectFederalRegister(periodStart) {
       issue_date     : r.publication_date || '',
       url            : r.html_url || '',
       url_source     : 'Federal Register',
-      url_status     : r.html_url ? 'OK(API)' : ''
+      url_status     : r.html_url ? URL_STATUS_OFFICIAL : '',
+      provenance     : '공식'
     };
     item.importance = _autoImportance(item);
     out.push(item);
@@ -936,7 +1036,8 @@ function _collectEuClassificationRegs(periodStart) {
       issue_date     : date,
       url            : 'https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:' + encodeURIComponent(celex),
       url_source     : 'EUR-Lex',
-      url_status     : 'OK(API)'   // 공식 영구 URL
+      url_status     : URL_STATUS_OFFICIAL,  // 공식 영구 URL
+      provenance     : '공식'
     };
     item.importance = _autoImportance(item);
     out.push(item);
@@ -947,11 +1048,8 @@ function _collectEuClassificationRegs(periodStart) {
 /** 텍스트에서 모니터링 기업명 탐지 (API 항목은 기업 필드가 없으므로 제목/요약에서 추출) */
 function _detectCompany(text) {
   var low = String(text || '').toLowerCase();
-  var names = { 'apple': 'Apple', 'samsung': 'Samsung', 'lg electronics': 'LG Electronics',
-                'huawei': 'Huawei', 'xiaomi': 'Xiaomi', 'oppo': 'Oppo', 'vivo': 'Vivo',
-                'whirlpool': 'Whirlpool', 'haier': 'Haier' };
   var found = '';
-  Object.keys(names).forEach(function(k) { if (!found && low.indexOf(k) !== -1) found = names[k]; });
+  MONITORED_COMPANIES.forEach(function(k) { if (!found && low.indexOf(k) !== -1) found = COMPANY_DISPLAY_NAMES[k]; });
   return found;
 }
 
@@ -973,19 +1071,26 @@ function _normalizeHs(hs) {
   return { chapter: digits.substring(0, 2), code6: digits.substring(0, 6), digits: digits };
 }
 
-/** 항목이 모니터링 범위(회사/제품군/HS류)에 드는지 판정 + 매칭근거 반환 */
+/**
+ * 항목이 모니터링 범위(회사/제품군/HS류)에 드는지 판정 + 매칭근거 반환.
+ * 영어 키워드뿐 아니라 한국어 등 현지어 키워드(MONITORED_*_LOCAL)도 함께 검사해
+ * 한국·일본·중국 등 로컬 소스 Gemini 결과가 언어 차이만으로 탈락하지 않도록 한다.
+ * ※ 이 함수는 provenance==='공식'(공식 API 직수집) 항목에는 적용하지 않는다 — _scopeFilterAndTag 참고.
+ */
 function _scopeMatch(item) {
   var hay = (String(item.title_en || '') + ' ' + String(item.title || '') + ' ' +
              String(item.summary || '') + ' ' + String(item.product_name_en || '') + ' ' +
              String(item.product_name || '') + ' ' + String(item.company || '')).toLowerCase();
   var co = String(item.company || '').toLowerCase();
+  var allCompanies = MONITORED_COMPANIES.concat(MONITORED_COMPANIES_LOCAL);
+  var allProducts  = MONITORED_PRODUCT_TERMS.concat(MONITORED_PRODUCT_TERMS_LOCAL);
 
-  if (co && MONITORED_COMPANIES.some(function(c) { return co.indexOf(c) !== -1; }))
+  if (co && allCompanies.some(function(c) { return co.indexOf(c) !== -1; }))
     return { pass: true, reason: '회사:' + item.company };
-  var hitCo = MONITORED_COMPANIES.filter(function(c) { return hay.indexOf(c) !== -1; });
+  var hitCo = allCompanies.filter(function(c) { return hay.indexOf(c) !== -1; });
   if (hitCo.length) return { pass: true, reason: '회사:' + hitCo[0] };
 
-  var hitP = MONITORED_PRODUCT_TERMS.filter(function(p) { return hay.indexOf(p) !== -1; });
+  var hitP = allProducts.filter(function(p) { return hay.indexOf(p) !== -1; });
   if (hitP.length) return { pass: true, reason: '제품:' + hitP[0].trim() };
 
   var ch = _normalizeHs(item.hs_code).chapter;
@@ -994,70 +1099,82 @@ function _scopeMatch(item) {
   return { pass: false, reason: '' };
 }
 
-/** 출처유형: 공식 API/DB 직수집인가, AI(Gemini) 검색인가 */
-function _provenanceOf(item) {
-  if (String(item.url_status || '').indexOf('OK(API)') !== -1) return '공식';
-  var s = String(item.source || '');
-  if (/CBP|Federal Register|EUR-Lex|EBTI|분류규칙/.test(s)) return '공식';
-  return 'AI검색';
-}
-
-/** issue_date가 너무 과거(STALE_RULING_MONTHS개월 이전)면 stale */
-function _isStale(item, periodStart) {
-  var d = new Date(item.issue_date);
-  if (isNaN(d.getTime())) return false; // 날짜 불명은 통과(보도지연 등)
-  var cutoff = new Date(periodStart.getTime());
-  cutoff.setMonth(cutoff.getMonth() - STALE_RULING_MONTHS);
-  return d < cutoff;
+/**
+ * 1차 필터: 스코프(회사/제품/HS류) 판정 + hs_chapter 태깅. 네트워크 호출 없음(저비용) — URL 검증 전에 실행해
+ * 검증 대상 건수를 줄인다.
+ * provenance==='공식'(CBP/FedReg/EUR-Lex 직수집) 항목은 스코프 검사를 건너뛴다: 이미 검색어/신호어 자체가
+ * 관세 분류 룰링으로 좁혀져 있고(CBP_SEARCH_TERMS, FEDREG_RULING_SIGNALS, EU 분류규칙 SPARQL 필터),
+ * EU 관보 시행규칙처럼 title에 품목명이 아예 없는 정상 항목까지 스코프 미달로 버려지는 것을 방지한다.
+ */
+function _scopeFilterAndTag(items, periodStart) {
+  var dropScope = 0;
+  var out = [];
+  items.forEach(function(it) {
+    if (it.provenance === '공식') {
+      it.match_reason = it.match_reason || '공식출처(직수집)';
+    } else {
+      var m = _scopeMatch(it);
+      if (!m.pass) { dropScope++; return; }
+      it.match_reason = m.reason;
+    }
+    it.hs_chapter = _normalizeHs(it.hs_code).chapter;
+    out.push(it);
+  });
+  Logger.log('[refine] 스코프 제외 ' + dropScope + '건 → ' + out.length + '건 통과 (URL 검증 대상)');
+  return out;
 }
 
 /**
- * 수집·검증 후 정확성/필터 일괄 적용.
- *  1) 스코프(회사/제품/HS류) 미달 → 제외
- *  2) stale(너무 과거 게시일) → 제외
- *  3) 미검증 AI검색 항목 → 제외 (단 회사 직접 관련 '상'은 예외 유지)
- *  통과 항목에 provenance / hs_chapter / match_reason 태깅.
+ * 2차 필터: URL 검증(_verifyItemUrls) 결과를 반영해 미검증 AI검색 항목을 제외.
+ * 단, 중요도 '상'은 예외로 유지(모델 루브릭상 '상'은 이미 기업 직접관련/핵심품목 분쟁 요건을 충족한 것이므로
+ * company 필드가 비어 있다는 이유만으로 예외를 거부하지 않는다).
  */
-function _refineResults(items, periodStart) {
-  var drop = { scope: 0, stale: 0, unverified: 0 };
-  var out  = [];
+function _applyUnverifiedDrop(items) {
+  var dropUnverified = 0;
+  var out = [];
   items.forEach(function(it) {
-    var m = _scopeMatch(it);
-    if (!m.pass) { drop.scope++; return; }
-    if (_isStale(it, periodStart)) { drop.stale++; return; }
-
-    it.provenance = _provenanceOf(it);
-    it.hs_chapter = _normalizeHs(it.hs_code).chapter;
-    it.match_reason = m.reason;
-
-    // 출처 불분명 = 원문 URL이 없거나 접속 실패한 AI검색 항목 (단순 미점검 'SKIP'은 유지)
     var hasUrl = it.url && /^https?:\/\//i.test(it.url);
     var failed = String(it.url_status || '').indexOf('FAIL') !== -1;
     if (DROP_UNVERIFIED_AI && it.provenance === 'AI검색' && (!hasUrl || failed)) {
-      var keepException = (it.importance === '상' && it.company);  // 회사 직접 '상'은 예외 유지
-      if (!keepException) { drop.unverified++; return; }
+      if (it.importance !== '상') { dropUnverified++; return; }
       it.url_status = it.url_status || '미검증';
     }
     out.push(it);
   });
-  Logger.log('[refine] 제외 — 스코프 ' + drop.scope + ' / 과거 ' + drop.stale + ' / 미검증 ' + drop.unverified +
-             ' → 통과 ' + out.length);
+  Logger.log('[refine] 미검증 제외 ' + dropUnverified + '건 → 최종 ' + out.length + '건');
   return out;
 }
 
 // ─── 중복 제거 ───────────────────────────────────────────────────────────────
 
+/**
+ * 중복판정 키 목록 생성.
+ *  - ruling_number가 있으면 그것만으로 판정한다(N-키 단독) — CBP 룰링처럼 제목이 정형화된 문구
+ *    ("The tariff classification of a smartphone from China" 등)라서 서로 다른 번호의 룰링이
+ *    영문제목 80자 접두어가 우연히 같아지는 경우, T-키까지 같이 반환하면 keys.some() 방식의
+ *    _dedupResults가 번호가 다른 진짜 신규 룰링을 오탐 제거하기 때문.
+ *  - ruling_number가 없으면(주로 한국어 로컬 소스) 영문제목 T-키와, 국가+HS코드+게시일+한국어제목
+ *    복합키(C-키)를 함께 반환해 완전히 키가 비어 dedup을 우회하는 것을 방지한다.
+ */
 function _itemKeys(item) {
-  var keys = [];
   var country = String(item.country || '').trim();
   var num     = String(item.ruling_number || '').trim();
+  if (num) return ['N|' + country + '|' + num];
+
+  var keys = [];
   var titleEn = String(item.title_en || '').toLowerCase().replace(/\s+/g, ' ').trim();
-  if (num)     keys.push('N|' + country + '|' + num);
   if (titleEn) keys.push('T|' + country + '|' + titleEn.substring(0, 80));
+
+  var titleKo = String(item.title || item.product_name || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (titleKo) {
+    var composite = country + '|' + String(item.hs_code || '').trim() + '|' +
+                    String(item.issue_date || '').trim() + '|' + titleKo.substring(0, 60);
+    keys.push('C|' + composite);
+  }
   return keys;
 }
 
-/** 동향DB의 기존 (국가+Ruling번호 / 국가+영문제목) 키 집합 로드 — 최근 2000행만 */
+/** 동향DB의 기존 (국가+Ruling번호 / 국가+영문제목 / 국가+HS+게시일+한글제목) 키 집합 로드 — 최근 2000행만 */
 function _loadExistingKeys() {
   var keySet = {};
   try {
@@ -1068,7 +1185,8 @@ function _loadExistingKeys() {
     var startRow = Math.max(2, lastRow - 2000 + 1);
     var data = sheet.getRange(startRow, 1, lastRow - startRow + 1, 14).getValues();
     data.forEach(function(row) {
-      _itemKeys({ country: row[2], ruling_number: row[4], title_en: row[10] })
+      _itemKeys({ country: row[2], ruling_number: row[4], hs_code: row[5],
+                  title: row[9], title_en: row[10], issue_date: row[12] })
         .forEach(function(k) { keySet[k] = true; });
     });
   } catch (e) {
@@ -1095,65 +1213,71 @@ function _dedupResults(results) {
 /**
  * 수집된 url을 실제 접속해 검증하고 item.url_status에 기록.
  *  - 200~399          : OK
- *  - 401/403/405/429  : OK(차단) — URL은 존재하나 봇 차단으로 추정 → 링크 유지
+ *  - 401/403/405/429  : OK — URL은 존재하나 봇 차단으로 추정 → 링크 유지
  *  - 그 외(404 등)    : FAIL — 이메일에서 원문 버튼 대신 검색 버튼으로 대체
- * Apps Script 실행시간 제한을 고려해 최대 URL_VERIFY_MAX건만 검증.
+ *  - SKIP             : 검증 미완료(한도 초과 또는 시간예산 소진) — FAIL 아님이므로 링크는 유지
+ *
+ * ラウンド(hop) 단위 배치 처리: 항목별로 순차 리다이렉트를 추적하던 이전 방식은 검증 대상 60건 ×
+ * 최대 5홉 = 최대 300회의 순차 HTTP 요청이 되어 Apps Script 6분 실행 한도를 검증 단계 혼자 넘길 수 있었다.
+ * 이제 모든 대상의 "현재 홉"을 UrlFetchApp.fetchAll()로 한 번에(라운드당 1회) 병렬 조회하므로,
+ * 총 호출 횟수가 O(대상 수 × 홉 수)에서 O(홉 수)로 줄어든다. 남은 실행시간이 부족하면 그 라운드에서
+ * 중단하고 나머지는 SKIP 처리 — 이 함수가 전체 실행시간을 소진해 저장/발송이 아예 안 되는 사태를 방지한다.
+ * validateHttpsCertificates는 지정하지 않아 기본값(true, 인증서 검증)을 사용한다 — 모델이 제공한 임의
+ * URL의 리다이렉트를 인증서 검증 없이 추적하면 MITM에 의해 저장 URL이 조작될 수 있기 때문.
  */
 function _verifyItemUrls(items) {
   var targets = [];
   items.forEach(function(it) {
-    if (String(it.url_status || '').indexOf('OK(API)') !== -1) return;  // 공식 API URL은 검증 불필요
+    if (String(it.url_status || '').indexOf(URL_STATUS_OFFICIAL) !== -1) return;  // 공식 API URL은 검증 불필요
     if (!it.url) { it.url_status = it.url_status || ''; return; }
     if (!/^https?:\/\//i.test(it.url)) { it.url = ''; it.url_status = 'FAIL(형식)'; return; }
     if (targets.length < URL_VERIFY_MAX) targets.push(it);
     else it.url_status = 'SKIP';
   });
+  if (!targets.length) return;
 
-  targets.forEach(function(it) {
-    var resolved = _resolveFinalUrl(it.url);
-    if (resolved.finalUrl && /^https?:\/\//i.test(resolved.finalUrl)) {
-      it.url = resolved.finalUrl;   // 그라운딩 임시 리다이렉트 → 영구 canonical URL로 치환
+  var state = targets.map(function(it) { return { item: it, current: it.url, done: false, status: '' }; });
+
+  for (var hop = 0; hop < URL_VERIFY_MAX_HOPS; hop++) {
+    if (_budgetLeft() < VERIFY_TIME_RESERVE_MS) {
+      Logger.log('[verifyUrls] 시간예산 부족 — 나머지 ' + state.filter(function(s) { return !s.done; }).length + '건은 SKIP');
+      break;
     }
-    it.url_status = resolved.status;
-  });
-}
+    var pending = state.filter(function(s) { return !s.done; });
+    if (!pending.length) break;
 
-/**
- * URL을 수동으로 리다이렉트 추적해 ① 최종 도착 URL(canonical) ② 접속 상태를 반환.
- * Gemini 그라운딩의 vertexaisearch 리다이렉트 URL은 임시(만료)이므로,
- * 최종 도착 URL을 잡아 저장해야 동향DB 아카이브 링크가 나중에도 살아 있다.
- * @returns {{ finalUrl: string, status: string }}
- */
-function _resolveFinalUrl(url) {
-  var current = url, finalUrl = url, status = 'SKIP';
-  try {
-    for (var hop = 0; hop < 5; hop++) {
-      var resp = UrlFetchApp.fetch(current, {
-        method: 'get', muteHttpExceptions: true,
-        followRedirects: false, validateHttpsCertificates: false
-      });
+    var reqs = pending.map(function(s) {
+      return { url: s.current, method: 'get', muteHttpExceptions: true, followRedirects: false };
+    });
+    var resps;
+    try { resps = UrlFetchApp.fetchAll(reqs); }
+    catch (e) {
+      pending.forEach(function(s) { s.done = true; s.status = 'SKIP'; });
+      break;
+    }
+    resps.forEach(function(resp, i) {
+      var s = pending[i];
       var c = resp.getResponseCode();
       if (c >= 300 && c < 400) {
         var loc = resp.getAllHeaders()['Location'] || resp.getAllHeaders()['location'] || '';
         if (Array.isArray(loc)) loc = loc[0];
-        if (!loc) { status = 'OK'; break; }
-        // 상대경로 보정
-        if (/^https?:\/\//i.test(loc)) { current = loc; }
-        else { current = current.replace(/^(https?:\/\/[^\/]+).*$/, '$1') + (loc.charAt(0) === '/' ? '' : '/') + loc; }
-        finalUrl = current;
-        continue;
-      }
-      if ((c >= 200 && c < 300) || c === 401 || c === 403 || c === 405 || c === 429) {
-        finalUrl = current; status = 'OK';
+        if (!loc) { s.done = true; s.status = 'OK'; return; }
+        if (/^https?:\/\//i.test(loc)) { s.current = loc; }
+        else { s.current = s.current.replace(/^(https?:\/\/[^\/]+).*$/, '$1') + (loc.charAt(0) === '/' ? '' : '/') + loc; }
+        // 다음 라운드에서 이 URL로 계속 추적
+      } else if ((c >= 200 && c < 300) || c === 401 || c === 403 || c === 405 || c === 429) {
+        s.done = true; s.status = 'OK';
       } else {
-        status = 'FAIL(' + c + ')';
+        s.done = true; s.status = 'FAIL(' + c + ')';
       }
-      break;
-    }
-  } catch (e) {
-    status = 'SKIP';
+    });
   }
-  return { finalUrl: finalUrl, status: status };
+
+  state.forEach(function(s) {
+    if (!s.done) s.status = 'SKIP'; // 홉 소진 또는 시간예산 부족 — 진행 중이던 URL은 유지
+    if (s.current && /^https?:\/\//i.test(s.current)) s.item.url = s.current; // 최종 canonical URL로 치환
+    s.item.url_status = s.status;
+  });
 }
 
 // ─── "HS 요청" 메일 수신 감지 및 자동 재발송 ─────────────────────────────────
@@ -1187,12 +1311,24 @@ function checkHsRequestEmails() {
     return;
   }
 
+  // 수신자 화이트리스트 (소문자 정규화) — 스레드 매칭은 "스레드 내 아무 메시지나 whitelist 발신"이면
+  // 성립하므로, 실제 발송 전 마지막 메시지의 발신자를 다시 한번 화이트리스트와 대조해야 한다.
+  // (그렇지 않으면 스푸핑된 From, 또는 화이트리스트 스레드에 끼어든 제3자에게 리포트가 발송될 수 있음)
+  var recipientSet = {};
+  recipients.forEach(function(e) { recipientSet[e.toLowerCase()] = true; });
+
   threads.forEach(function(thread) {
     var messages = thread.getMessages();
     var lastMsg  = messages[messages.length - 1];
     var fromRaw  = lastMsg.getFrom();
     var m        = fromRaw.match(/<([^>]+)>/);
     var requester = (m ? m[1] : fromRaw).trim();
+
+    if (!recipientSet[requester.toLowerCase()]) {
+      Logger.log('[checkHsRequestEmails] 화이트리스트에 없는 발신자 — 발송 생략: ' + requester);
+      thread.addLabel(label);
+      return;
+    }
 
     Logger.log('[checkHsRequestEmails] "HS 요청" 감지: ' + requester);
 
@@ -1217,14 +1353,22 @@ function checkHsRequestEmails() {
  * 동향DB 시트에서 가장 마지막 실행분 데이터를 로드해 반환
  * (v3.0에서 추가된 카테고리/URL상태/URL출처 컬럼은 있으면 사용, 없으면 역매핑)
  */
+/** 시트 셀 값(문자열 또는 시트가 자동 변환한 Date 객체)을 비교 가능한 문자열로 정규화 */
+function _dateKey(v) {
+  if (Object.prototype.toString.call(v) === '[object Date]') return _fmtDateTime(v);
+  return String(v);
+}
+
 function _loadLastReportData() {
   var ss    = _getSpreadsheet();
   var sheet = ss.getSheetByName(DB_SHEET_NAME);
   if (!sheet || sheet.getLastRow() <= 1) return { results: [], dateRange: '' };
 
   var data        = sheet.getDataRange().getValues();
-  var lastRunTime = data[data.length - 1][0];
-  var recentRows  = data.slice(1).filter(function(row) { return row[0] === lastRunTime; });
+  // '수집일시' 셀은 문자열로 썼지만 시트가 locale에 따라 Date로 자동 변환할 수 있어,
+  // Date 객체끼리 === 비교하면 참조가 달라 항상 false가 된다 → 문자열로 정규화해 비교.
+  var lastRunKey  = _dateKey(data[data.length - 1][0]);
+  var recentRows  = data.slice(1).filter(function(row) { return _dateKey(row[0]) === lastRunKey; });
 
   var results = recentRows.map(function(row) {
     return {
@@ -1323,7 +1467,9 @@ function _buildRequest(region, apiKey, dateRangeStr, year) {
     'JSON_RESULT_START\n' +
     '[\n' +
     '  {\n' +
-    '    "country": "' + region.region + '",\n' +
+    // isGroup 지역은 복합 라벨(예: '아르헨티나/칠레/파나마')이 아니라 실제 단일 국가명 예시를 시딩해
+    // 모델이 템플릿 문자열을 그대로 echo하는 것을 방지 (런타임 검증은 runHSRulingMonitor에서 재확인)
+    '    "country": "' + ((region.isGroup && region.countries && region.countries.length) ? region.countries[0] : region.region) + '",\n' +
     '    "source": "' + region.source + '",\n' +
     '    "ruling_number": "",\n' +
     '    "hs_code": "",\n' +
@@ -1350,9 +1496,10 @@ function _buildRequest(region, apiKey, dateRangeStr, year) {
   };
 
   return {
-    url               : 'https://generativelanguage.googleapis.com/v1beta/models/' + MODEL_NAME + ':generateContent?key=' + apiKey,
+    url               : 'https://generativelanguage.googleapis.com/v1beta/models/' + MODEL_NAME + ':generateContent',
     method            : 'post',
     contentType       : 'application/json',
+    headers           : { 'x-goog-api-key': apiKey },  // 쿼리스트링 대신 헤더로 전달 — 로그 노출 방지
     payload           : JSON.stringify(payload),
     muteHttpExceptions: true
   };
@@ -1643,8 +1790,18 @@ function _buildEmailHtml(results, dateRangeStr, dupCount) {
   var now        = _fmtDateTime(new Date());
   var totalCount = results.length;
 
-  // ※ MONITORING_REGIONS의 category와 반드시 일치해야 함 (불일치 시 해당 카테고리 메일 누락)
-  var CATEGORY_ORDER = ['동북아', '중국', '북미', '중남미', '인도', '유럽', '중동', '동남아', '아프리카', 'CIS', '글로벌'];
+  // 선호 순서는 유지하되, MONITORING_REGIONS에 새 카테고리가 추가돼도 자동으로 뒤에 포함되도록 파생.
+  // (v3.0에서 '동북아'를 이 배열에 손으로 추가하지 않아 한국·일본 결과가 메일에서 통째로 빠졌던 사고가
+  //  재발하지 않도록, 수동 목록을 "1차 정렬 힌트"로만 쓰고 실제 포함 여부는 MONITORING_REGIONS가 결정한다.)
+  var CATEGORY_ORDER = (function() {
+    var preferred = ['동북아', '중국', '북미', '중남미', '인도', '유럽', '중동', '동남아', '아프리카', 'CIS', '글로벌'];
+    var seen = {};
+    preferred.forEach(function(c) { seen[c] = true; });
+    MONITORING_REGIONS.forEach(function(r) {
+      if (!seen[r.category]) { seen[r.category] = true; preferred.push(r.category); }
+    });
+    return preferred;
+  })();
   var IMP_RANK = { '상': 0, '중': 1, '하': 2 };
 
   var byCat = {};
@@ -1859,8 +2016,8 @@ function listAvailableModels() {
   var apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
   if (!apiKey) throw new Error('[오류] GEMINI_API_KEY가 설정되지 않았습니다.');
   var resp = UrlFetchApp.fetch(
-    'https://generativelanguage.googleapis.com/v1beta/models?key=' + apiKey,
-    { muteHttpExceptions: true }
+    'https://generativelanguage.googleapis.com/v1beta/models',
+    { muteHttpExceptions: true, headers: { 'x-goog-api-key': apiKey } }
   );
   var body = JSON.parse(resp.getContentText());
   (body.models || []).forEach(function(m) {
