@@ -2,6 +2,17 @@
  * HS Code 유권해석(Ruling) 주간 모니터링 시스템
  * ─────────────────────────────────────────────
  * [변경 이력]
+ * v4.4 (수집량 우선 모드 — "정보가 너무 안 잡힌다" 대응)
+ *  - RECALL_MODE 도입 (기본 true): 스코프 재검사·URL 미검증을 이유로 항목을 버리지 않고
+ *    '원문 미확인'/'모델판정' 태그로 구분만 한다 — Gemini 프롬프트의 MANDATORY GATE가 이미
+ *    룰링/정책을 걸러주므로 코드 레벨 재필터는 태깅 역할만 수행. false로 바꾸면 기존 정확성 우선 동작.
+ *  - 조회기간 14일 → 30일 (dedup이 있어 중복 없이 회수율만 상승)
+ *  - 한국·중국을 공식 DB / 뉴스·업계 2개 패스로 분할 (검색 패스 23 → 25개)
+ *  - Gemini 결과 상한 15 → 25건 + "빠짐없이 전부 보고(be EXHAUSTIVE)" 지시 추가
+ *  - CBP CROSS 페이지네이션 (CBP_PAGES=2 → 검색어당 최대 100건)
+ *  - 이메일 헤더에 수집 파이프라인 통계 표기 (수집→중복제외→스코프→최종/미확인) —
+ *    어디서 몇 건이 걸러졌는지 리포트에서 바로 확인 가능
+ *
  * v4.3 (코드 리뷰 반영 — 버그/성능/보안/가독성 전면 수정)
  *  - [성능/핵심] 6분 실행제한으로 인한 전체 유실 방지:
  *      · 시간예산(EXEC_BUDGET_MS) 도입 — 재시도/URL검증이 예산을 넘기면 조기 중단하고
@@ -115,7 +126,13 @@ var MODEL_NAME      = 'gemini-2.5-flash';
 var DB_SHEET_NAME   = '동향DB';
 var RCPT_SHEET_NAME = '발송인 명단';
 
-var MONITORING_DAYS = 14;
+var MONITORING_DAYS = 30;   // 조회기간 — dedup이 있으므로 넓혀도 중복 없이 회수율만 상승
+
+// ─── 수집량 우선 모드 ────────────────────────────────────────────────────────
+// true  : 최대 수집 — 스코프 재검사·URL 미검증을 이유로 버리지 않고 '미검증' 배지로 구분만 한다.
+//         (Gemini 프롬프트의 MANDATORY GATE가 이미 룰링/정책을 걸러주므로 코드 재필터는 태깅만)
+// false : 정확성 우선 — 기존 v4.2~4.3 동작 (스코프 미달·미검증 AI검색 항목 제외)
+var RECALL_MODE = true;
 
 // API 호출 배치 크기/대기 — 무료 등급은 분당 요청 제한이 낮으므로 배치로 나눠 호출
 var API_BATCH_SIZE     = 7;
@@ -146,8 +163,9 @@ var URL_STATUS_OFFICIAL = 'OK(API)';   // 공식 API/DB 직수집 — 접속 검
 var USE_CBP_API          = true;   // 美 CBP CROSS 분류 결정 JSON API (무인증)
 var USE_FEDERAL_REGISTER = true;   // 美 Federal Register API (무인증) — CBP 분류 고시/결정
 var USE_EU_EURLEX        = true;   // EU EUR-Lex(CELLAR SPARQL) 분류규칙 직수집 (무인증, best-effort)
-var CBP_PAGE_SIZE        = 50;     // CBP 검색어당 최대 조회 건수 (최신순)
-var CBP_MAX_PER_TERM     = 50;     // 검색어당 기간 내 채택 상한
+var CBP_PAGE_SIZE        = 50;     // CBP 검색어당 페이지 크기 (최신순)
+var CBP_PAGES            = 2;      // 검색어당 조회 페이지 수 — 2면 최대 100건/검색어
+var CBP_MAX_PER_TERM     = 100;    // 검색어당 기간 내 채택 상한
 var EURLEX_MAX           = 80;     // EU 분류규칙 최대 수집 건수
 
 // ─── 정확성/출처 정책 (1단계) ───────────────────────────────────────────────
@@ -235,14 +253,20 @@ var SHEET_HIGHLIGHT_BG = '#fff5f5';  // 중요도 '상' 행 하이라이트
 // prompt 내 {DAYS} → MONITORING_DAYS, {YEAR} → 실행 연도로 자동 치환됨
 var MONITORING_REGIONS = [
 
-  // ── 동북아 ──
+  // ── 동북아 ── (한국은 공식 DB / 뉴스·업계 2개 패스로 분할해 회수율 확대)
   {
-    category: '동북아', region: '한국',
+    category: '동북아', region: '한국', countryName: '한국',
     source  : '관세청 CLIP (관세평가분류원)',
-    prompt  : 'Search for HS Code tariff classification rulings from South Korea published in the last {DAYS} days. ' +
-              'Look broadly in: Korea Customs CLIP / 관세법령정보포털 (unipass.customs.go.kr/clip), 관세평가분류원 보도자료, customs news sites (한국관세신문, 관세무역신문), trade publications, and any web source reporting on Korean customs rulings. ' +
-              'Keywords: "품목분류 사전심사" "관세품목분류위원회 결정" "HS코드 유권해석" "품목분류 결정례" "스마트폰" "에어컨" "Samsung" "LG전자" "tariff classification ruling Korea {YEAR}". ' +
-              'Do NOT limit results to official DB only — news articles and trade reports are acceptable.'
+    prompt  : 'Search for OFFICIAL HS Code tariff classification decisions from South Korea published in the last {DAYS} days. ' +
+              'Focus on official sources: 관세법령정보포털 CLIP (unipass.customs.go.kr/clip) 품목분류 결정례, 관세평가분류원 품목분류 사전심사, 관세품목분류위원회 결정, 관세청 보도자료·고시. ' +
+              'Keywords: "품목분류 사전심사" "관세품목분류위원회 결정" "품목분류 결정례" "관세청 고시 품목분류" "HS 품목분류" "{YEAR}".'
+  },
+  {
+    category: '동북아', region: '한국(뉴스)', countryName: '한국',
+    source  : '한국 관세 전문지·업계 보도',
+    prompt  : 'Search Korean customs news and trade press for HS Code tariff classification ruling CASES reported in the last {DAYS} days. ' +
+              'Look in: 한국관세신문, 관세무역신문, 조세일보, 법률신문, 관세법인·로펌 뉴스레터, and any Korean media reporting classification decisions, 조세심판원 품목분류 심판, or court rulings on HS classification. ' +
+              'Keywords: "품목분류 쟁송" "HS코드 유권해석" "품목분류 심판청구" "조세심판원 품목분류" "관세 분류 소송" "스마트폰" "에어컨" "삼성전자" "LG전자" "{YEAR}".'
   },
   {
     category: '동북아', region: '일본',
@@ -253,14 +277,20 @@ var MONITORING_REGIONS = [
               'Do NOT limit results to official DB only — news articles and trade reports are acceptable.'
   },
 
-  // ── 중국 ──
+  // ── 중국 ── (공식 归类决定 / 뉴스·업계 2개 패스로 분할)
   {
-    category: '중국', region: '중국',
-    source  : '中国海关总署 (China General Administration of Customs)',
-    prompt  : 'Search for HS Code tariff classification rulings from China published in the last {DAYS} days. ' +
-              'Look broadly in: China customs (customs.gov.cn), 归类决定 announcements, Chinese trade news, WTO notifications, and any web source reporting on Chinese customs classification. ' +
-              'Keywords: "商品归类" "归类决定" "税则归类" "海关总署公告 归类" "智能手机" "空调" "Samsung" "Huawei" "Apple" "China HS classification ruling {YEAR}". ' +
-              'Do NOT limit results to official DB only — news articles and trade reports are acceptable.'
+    category: '중국', region: '중국', countryName: '중국',
+    source  : '中国海关总署 归类决定',
+    prompt  : 'Search for OFFICIAL Chinese customs classification decisions (归类决定 / 商品归类) published in the last {DAYS} days. ' +
+              'Focus on: 海关总署公告 announcing 归类决定, customs.gov.cn, 中国海关杂志, 12360海关热线 classification notices. ' +
+              'Keywords: "海关总署公告 归类决定" "商品归类决定" "税则归类" "归类指南" "{YEAR}".'
+  },
+  {
+    category: '중국', region: '중국(뉴스)', countryName: '중국',
+    source  : '중국 관세·무역 전문지',
+    prompt  : 'Search Chinese trade press and customs consulting news for HS classification ruling cases reported in the last {DAYS} days. ' +
+              'Look in: Chinese trade news, customs broker/law firm alerts (KPMG/PwC China trade alerts, 关务小二, 云关通), WTO notifications, and any source reporting Chinese customs classification disputes or decisions. ' +
+              'Keywords: "商品归类 案例" "归类争议" "海关 归类 处罚" "智能手机 归类" "空调 归类" "Samsung" "Huawei" "Apple" "China HS classification {YEAR}".'
   },
 
   // ── 북미 ──
@@ -753,11 +783,20 @@ function runHSRulingMonitor() {
   // 2차: URL 실제 접속 검증 (시간예산 내에서 라운드 배치 처리 — 예산 소진 시 조기 중단, 이후 단계는 항상 실행)
   _verifyItemUrls(scoped);
 
-  // 3차: 미검증 AI검색 항목 제외 (검증 결과 확정 후 적용)
+  // 3차: 미검증 AI검색 항목 처리 (RECALL_MODE면 태깅만, 아니면 제외)
   var refined = _applyUnverifiedDrop(scoped);
 
+  // 수집 파이프라인 통계 — 메일 헤더에 표기해 "어디서 몇 건이 걸러졌는지" 가시화
+  var stats = {
+    collected : allResults.length,
+    deduped   : deduped.length,
+    scoped    : scoped.length,
+    final     : refined.length,
+    unverified: refined.filter(function(r) { return r.unverified; }).length
+  };
+
   _saveToSheet(refined, dateRangeStr);
-  _sendEmail(refined, dateRangeStr, dupCount);
+  _sendEmail(refined, dateRangeStr, dupCount, stats);
 
   Logger.log('[HSRulingMonitor] 완료. 발송 ' + refined.length + '건 / 수집 ' + deduped.length +
              '건 / 중복 제외 ' + dupCount + '건 / 소요시간 ' + Math.round(_elapsedMs() / 1000) + '초.');
@@ -838,10 +877,15 @@ function _fetchAllInBatches(requests) {
  * ※ CBP API 응답 필드명은 변동 가능 → 여러 후보 필드명을 폴백 처리. testCbpApi()로 실제 구조 확인 가능.
  */
 function _collectCbpRulings(periodStart) {
-  var reqs = CBP_SEARCH_TERMS.map(function(term) {
+  // 검색어 × 페이지 조합으로 요청 생성 (CBP_PAGES=2면 검색어당 최대 100건 조회)
+  var reqMeta = [];
+  CBP_SEARCH_TERMS.forEach(function(term) {
+    for (var p = 1; p <= CBP_PAGES; p++) reqMeta.push({ term: term, page: p });
+  });
+  var reqs = reqMeta.map(function(m) {
     return {
-      url: 'https://rulings.cbp.gov/api/search?term=' + encodeURIComponent(term) +
-           '&collection=ALL&sortBy=DATE_DESC&pageSize=' + CBP_PAGE_SIZE + '&page=1',
+      url: 'https://rulings.cbp.gov/api/search?term=' + encodeURIComponent(m.term) +
+           '&collection=ALL&sortBy=DATE_DESC&pageSize=' + CBP_PAGE_SIZE + '&page=' + m.page,
       method: 'get', muteHttpExceptions: true,
       headers: { 'Accept': 'application/json' }
     };
@@ -850,12 +894,12 @@ function _collectCbpRulings(periodStart) {
   // 배치 분할 + 429/5xx 재시도 재사용 (원래 단일 fetchAll은 재시도 없이 조용히 전체 실패했음)
   var resps = _fetchAllInBatches(reqs);
 
-  var bySeen = {};   // ruling number 기준 중복 제거 (검색어 간)
+  var bySeen = {};   // ruling number 기준 중복 제거 (검색어/페이지 간)
   var out    = [];
 
   resps.forEach(function(resp, ti) {
     if (!resp || resp.getResponseCode() !== 200) {
-      Logger.log('[CBP] "' + CBP_SEARCH_TERMS[ti] + '" HTTP ' + (resp ? resp.getResponseCode() : '없음'));
+      Logger.log('[CBP] "' + reqMeta[ti].term + '" p' + reqMeta[ti].page + ' HTTP ' + (resp ? resp.getResponseCode() : '없음'));
       return;
     }
     var data;
@@ -1114,8 +1158,15 @@ function _scopeFilterAndTag(items, periodStart) {
       it.match_reason = it.match_reason || '공식출처(직수집)';
     } else {
       var m = _scopeMatch(it);
-      if (!m.pass) { dropScope++; return; }
-      it.match_reason = m.reason;
+      if (m.pass) {
+        it.match_reason = m.reason;
+      } else if (RECALL_MODE) {
+        // 수집량 우선: 코드 키워드에 안 걸려도 버리지 않음 — Gemini 프롬프트의 A/B/C 조건을
+        // 이미 통과한 결과이므로(대부분 현지어라 영어 키워드 미스), 태깅만 하고 유지한다.
+        it.match_reason = '모델판정(키워드 미매칭)';
+      } else {
+        dropScope++; return;
+      }
     }
     it.hs_chapter = _normalizeHs(it.hs_code).chapter;
     out.push(it);
@@ -1135,9 +1186,17 @@ function _applyUnverifiedDrop(items) {
   items.forEach(function(it) {
     var hasUrl = it.url && /^https?:\/\//i.test(it.url);
     var failed = String(it.url_status || '').indexOf('FAIL') !== -1;
-    if (DROP_UNVERIFIED_AI && it.provenance === 'AI검색' && (!hasUrl || failed)) {
-      if (it.importance !== '상') { dropUnverified++; return; }
-      it.url_status = it.url_status || '미검증';
+    if (it.provenance === 'AI검색' && (!hasUrl || failed)) {
+      if (RECALL_MODE) {
+        // 수집량 우선: 버리지 않고 '미검증' 표시로 구분만 — 이메일에 별도 배지로 표기됨
+        it.unverified = true;
+        it.url_status = it.url_status || '미검증';
+      } else if (DROP_UNVERIFIED_AI && it.importance !== '상') {
+        dropUnverified++; return;
+      } else {
+        it.unverified = true;
+        it.url_status = it.url_status || '미검증';
+      }
     }
     out.push(it);
   });
@@ -1458,7 +1517,8 @@ function _buildRequest(region, apiKey, dateRangeStr, year) {
     '4. "importance": rate each ruling — "상" if a monitored company (Samsung, LG Electronics, Apple, etc.) is directly involved as applicant/party, ' +
        'or the classification of a core monitored product was changed or disputed; "중" if it concerns a monitored product category; ' +
        '"하" if relevant only by HS chapter. Use exactly one of: 상 / 중 / 하.\n' +
-    '5. Return AT MOST 15 rulings, most recent first.\n' +
+    '5. Be EXHAUSTIVE: report EVERY distinct ruling you find in the search results — do NOT summarize down to a few highlights. ' +
+       'Return up to 25 rulings, most recent first.\n' +
     '6. Output STRICTLY VALID JSON between the markers: double-quoted keys and strings, no trailing commas, no comments, ' +
        'escape internal double quotes as \\". Do not wrap the JSON in markdown code fences.\n' +
     '7. Briefly describe findings in natural language first, then output the JSON block.\n' +
@@ -1700,10 +1760,10 @@ function _getRecipients() {
 
 // ─── 메일 발송 ───────────────────────────────────────────────────────────────
 
-function _sendEmail(results, dateRangeStr, dupCount) {
+function _sendEmail(results, dateRangeStr, dupCount, stats) {
   var recipients = _getRecipients();
   if (!recipients.length) return;
-  var html    = _buildEmailHtml(results, dateRangeStr, dupCount || 0);
+  var html    = _buildEmailHtml(results, dateRangeStr, dupCount || 0, stats);
   var subject = '[HS Ruling 동향] 주간 유권해석 모니터링 | HS Classification Ruling Report (' + dateRangeStr + ')';
   recipients.forEach(function(email) {
     try {
@@ -1739,9 +1799,12 @@ function _buildItemCard(item) {
   var impBg    = IMPORTANCE_BG[imp];
 
   var badges = _badge('중요도 ' + imp, impColor, impBg, impColor);
-  // 출처유형: 공식(검증) vs AI검색 — 신뢰도 구분
+  // 출처유형: 공식(검증) vs AI검색 — 신뢰도 구분. 원문 URL 미확인 항목은 '미검증'을 별도 표기.
   if (item.provenance === '공식') badges += _badge('공식·검증', '#1b5e3b', '#e7f4ec', '#bfe0cc');
   else if (item.provenance === 'AI검색') badges += _badge('AI검색', '#6d3b00', '#fbf0e3', '#e7cfb0');
+  if (item.unverified || String(item.url_status || '') === '미검증') {
+    badges += _badge('원문 미확인', '#8a6d00', '#fdf8e3', '#e8d98a');
+  }
   if (item.hs_code) badges += _badge('HS ' + _escapeHtml(item.hs_code), '#15418c', '#e8eef7', '#c9d6ea');
   if (item.company) badges += _badge(_escapeHtml(item.company), '#7b3000', '#fdf3e7', '#ecd9c0');
   if (item.ruling_number) {
@@ -1786,7 +1849,7 @@ function _buildItemCard(item) {
   '</table>';
 }
 
-function _buildEmailHtml(results, dateRangeStr, dupCount) {
+function _buildEmailHtml(results, dateRangeStr, dupCount, stats) {
   var now        = _fmtDateTime(new Date());
   var totalCount = results.length;
 
@@ -1910,6 +1973,13 @@ function _buildEmailHtml(results, dateRangeStr, dupCount) {
       '<b style="color:#ef6c00;">중</b>(모니터링 품목)&nbsp;·&nbsp;' +
       '<b style="color:#2e7d32;">하</b>(HS류 관련)' +
     '</div>' +
+    (stats
+      ? '<div style="font-size:11px;color:#5d7a68;line-height:1.7;margin-top:3px;">' +
+          '수집 파이프라인&nbsp;:&nbsp;수집 ' + stats.collected + '건 → 중복 제외 후 ' + stats.deduped +
+          '건 → 스코프 통과 ' + stats.scoped + '건 → 최종 <b>' + stats.final + '</b>건' +
+          (stats.unverified > 0 ? ' (이 중 원문 미확인 ' + stats.unverified + '건 포함)' : '') +
+        '</div>'
+      : '') +
   '</td></tr>' +
 
   (totalCount > 0
