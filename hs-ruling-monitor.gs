@@ -2,6 +2,17 @@
  * HS Code 유권해석(Ruling) 주간 모니터링 시스템
  * ─────────────────────────────────────────────
  * [변경 이력]
+ * v4.6 (직수집기 추가 — 뉴스 RSS 14피드 + GOV.UK API)
+ *  - [핵심] Google News RSS 직수집(_collectRssNews): 국가·현지어별 14개 피드
+ *      (한국어/일본어/중국어/베트남어/포르투갈어/스페인어/터키어/러시아어/독일어/아랍어/영어 + 인도 Taxscan·TaxGuru RSS).
+ *      Gemini 그라운딩과 달리 쿼리 결과를 결정적으로 전부 반환 → 지역 뉴스 커버리지의 바닥을 보장.
+ *      Google News 리다이렉트 링크는 기존 URL 검증 단계가 최종 기사 URL로 해소.
+ *  - [핵심] 英 GOV.UK Search API 직수집(_collectGovUkDecisions): "tariff classification" 심판결정·가이던스,
+ *      gov.uk 영구 URL(공식 출처).
+ *  - 출처유형 '뉴스RSS' 신설 (배지·시트 표기) — 공식/뉴스RSS/AI검색 3단계 신뢰도 구분
+ *  - URL 검증 한도 60 → 90 (RSS 리다이렉트 해소 물량 반영)
+ *  - 진단 함수 testRssNews() / testGovUk() 추가
+ *
  * v4.5 (프롬프트 전면 재설계 — 그라운딩 검색 방식에 맞춤)
  *  - [공통] SEARCH RULES 신설: 최소 5회 개별 검색 / 현지어 우선 / site: 연산자 활용 /
  *      검색어에 제품·기업명 금지(넓게 검색 → 보고 단계에서 필터) / 날짜는 페이지 본문에서 확인
@@ -154,8 +165,8 @@ var API_BATCH_SIZE     = 7;
 var API_BATCH_PAUSE_MS = 2000;
 var API_MAX_RETRY      = 2;     // 429/5xx 시 개별 재시도 횟수
 
-// URL 실접속 검증 최대 건수 (Apps Script 6분 실행 제한 고려)
-var URL_VERIFY_MAX      = 60;
+// URL 실접속 검증 최대 건수 (Apps Script 6분 실행 제한 고려 — RSS 리다이렉트 해소 물량 포함)
+var URL_VERIFY_MAX      = 90;
 var URL_VERIFY_MAX_HOPS = 5;      // 리다이렉트 추적 최대 홉 수 (라운드 단위 배치 처리)
 
 // ─── 실행시간 예산 (Apps Script 6분 하드 한도 대응) ──────────────────────────
@@ -178,6 +189,9 @@ var URL_STATUS_OFFICIAL = 'OK(API)';   // 공식 API/DB 직수집 — 접속 검
 var USE_CBP_API          = true;   // 美 CBP CROSS 분류 결정 JSON API (무인증)
 var USE_FEDERAL_REGISTER = true;   // 美 Federal Register API (무인증) — CBP 분류 고시/결정
 var USE_EU_EURLEX        = true;   // EU EUR-Lex(CELLAR SPARQL) 분류규칙 직수집 (무인증, best-effort)
+var USE_UK_GOVUK         = true;   // 英 GOV.UK Search API — 분류 심판결정/가이던스 (무인증, 영구 URL)
+var USE_RSS_NEWS         = true;   // Google News RSS + 전문지 RSS 직수집 — 전 지역 뉴스를 결정적으로 수집
+var RSS_MAX_PER_FEED     = 20;     // RSS 피드당 채택 상한
 var CBP_PAGE_SIZE        = 50;     // CBP 검색어당 페이지 크기 (최신순)
 var CBP_PAGES            = 2;      // 검색어당 조회 페이지 수 — 2면 최대 100건/검색어
 var CBP_MAX_PER_TERM     = 100;    // 검색어당 기간 내 채택 상한
@@ -239,6 +253,47 @@ var POLICY_EXCLUDE_TERMS = [
 // FedReg에서 '분류 룰링 사례'로 인정할 신호어 (룰링레터 수정/철회 고시 등)
 var FEDREG_RULING_SIGNALS = ['ruling letter', 'classification ruling', 'revocation of', 'modification of',
   'revoke', 'modify', 'tariff classification of', 'reconsideration of'];
+
+// ─── 뉴스 RSS 직수집 소스 ────────────────────────────────────────────────────
+// Google News RSS는 무인증·언어별 검색이 가능한 기계판독 소스 — Gemini 그라운딩과 달리
+// 쿼리당 결과를 결정적으로 전부 반환한다. 링크는 news.google.com 리다이렉트이지만
+// _verifyItemUrls가 최종 기사 URL로 해소한다. (함수 선언은 호이스팅되므로 초기화에 사용 가능)
+function _gnews(query, hl, gl, ceid) {
+  return 'https://news.google.com/rss/search?q=' + encodeURIComponent(query) +
+         '&hl=' + hl + '&gl=' + gl + '&ceid=' + encodeURIComponent(ceid);
+}
+
+// ko:true → 제목을 title(한국어 필드)에 저장. filter → 제목이 정규식과 일치할 때만 채택(범용 피드용).
+var RSS_SOURCES = [
+  { category: '동북아', country: '한국',   name: 'Google News 한국', ko: true,
+    url: _gnews('품목분류 OR "사전심사" 관세', 'ko', 'KR', 'KR:ko') },
+  { category: '동북아', country: '일본',   name: 'Google News 日本',
+    url: _gnews('事前教示 OR 品目分類 税関', 'ja', 'JP', 'JP:ja') },
+  { category: '중국',   country: '중국',   name: 'Google News 中国',
+    url: _gnews('商品归类 OR 归类决定', 'zh-CN', 'CN', 'CN:zh-Hans') },
+  { category: '동남아', country: '베트남', name: 'Google News Việt Nam',
+    url: _gnews('"phân loại hàng hóa" hải quan', 'vi', 'VN', 'VN:vi') },
+  { category: '중남미', country: '브라질', name: 'Google News Brasil',
+    url: _gnews('"classificação fiscal" OR "Solução de Consulta" NCM', 'pt-BR', 'BR', 'BR:pt-419') },
+  { category: '중남미', country: '멕시코', name: 'Google News México',
+    url: _gnews('"clasificación arancelaria"', 'es-419', 'MX', 'MX:es-419') },
+  { category: '인도',   country: '인도',   name: 'Google News India',
+    url: _gnews('customs classification ruling OR CAAR', 'en-IN', 'IN', 'IN:en') },
+  { category: '인도',   country: '인도',   name: 'Taxscan RSS',
+    filter: /classif|caar|cestat|customs|tariff/i, url: 'https://www.taxscan.in/feed/' },
+  { category: '인도',   country: '인도',   name: 'TaxGuru RSS',
+    filter: /classif|caar|cestat|customs|tariff/i, url: 'https://taxguru.in/feed/' },
+  { category: '중동',   country: '튀르키예', name: 'Google News Türkiye',
+    url: _gnews('"tarife sınıflandırma" OR "bağlayıcı tarife bilgisi"', 'tr', 'TR', 'TR:tr') },
+  { category: 'CIS',    country: '러시아', name: 'Google News Россия',
+    url: _gnews('"классификационное решение" OR "ТН ВЭД" классификация', 'ru', 'RU', 'RU:ru') },
+  { category: '유럽',   country: 'EU',     name: 'Google News Deutschland',
+    url: _gnews('Zolltarif Einreihung Urteil', 'de', 'DE', 'DE:de') },
+  { category: '중동',   country: '중동권', name: 'Google News العربية',
+    url: _gnews('تصنيف جمركي', 'ar', 'EG', 'EG:ar') },
+  { category: '글로벌', country: '글로벌', name: 'Google News Global',
+    url: _gnews('"tariff classification" ruling OR decision', 'en-US', 'US', 'US:en') }
+];
 
 // Gmail 폴링용 라벨 (처리 완료 메일 마킹 — 없으면 자동 생성)
 var PROCESSED_LABEL = 'HS-요청-처리완료';
@@ -865,6 +920,20 @@ function runHSRulingMonitor() {
       Logger.log('[EU EUR-Lex API] ' + eu.length + '건 수집');
     } catch (e) { Logger.log('[EU EUR-Lex API] 오류: ' + e.message); }
   }
+  if (USE_UK_GOVUK) {
+    try {
+      var uk = _collectGovUkDecisions(periodStart);
+      allResults.push.apply(allResults, uk);
+      Logger.log('[GOV.UK API] ' + uk.length + '건 수집');
+    } catch (e) { Logger.log('[GOV.UK API] 오류: ' + e.message); }
+  }
+  if (USE_RSS_NEWS) {
+    try {
+      var rss = _collectRssNews(periodStart);
+      allResults.push.apply(allResults, rss);
+      Logger.log('[뉴스 RSS] ' + rss.length + '건 수집 (' + RSS_SOURCES.length + '개 피드)');
+    } catch (e) { Logger.log('[뉴스 RSS] 오류: ' + e.message); }
+  }
 
   responses.forEach(function(resp, i) {
     var region = MONITORING_REGIONS[i];
@@ -1210,6 +1279,134 @@ function _collectEuClassificationRegs(periodStart) {
     };
     item.importance = _autoImportance(item);
     out.push(item);
+  });
+  return out;
+}
+
+/**
+ * 英 GOV.UK Search API 직수집 (무인증 JSON).
+ * "tariff classification" 관련 심판결정(Tribunal decisions)·가이던스를 최신순으로 조회.
+ * gov.uk 링크는 영구 URL — 접속 검증 생략.
+ */
+function _collectGovUkDecisions(periodStart) {
+  var url = 'https://www.gov.uk/api/search.json?q=' + encodeURIComponent('"tariff classification"') +
+            '&order=-public_timestamp&count=30' +
+            '&fields=title&fields=link&fields=public_timestamp&fields=description';
+
+  var resp;
+  try { resp = UrlFetchApp.fetch(url, { method: 'get', muteHttpExceptions: true }); }
+  catch (e) { Logger.log('[GOV.UK] fetch 오류: ' + e.message); return []; }
+  if (resp.getResponseCode() !== 200) {
+    Logger.log('[GOV.UK] HTTP ' + resp.getResponseCode());
+    return [];
+  }
+  var data;
+  try { data = JSON.parse(resp.getContentText()); } catch (e) { return []; }
+
+  var out = [];
+  (data.results || []).forEach(function(r) {
+    var ts = r.public_timestamp || '';
+    var d  = ts ? new Date(ts) : null;
+    if (d && !isNaN(d.getTime()) && d < periodStart) return;
+
+    var title = String(r.title || '');
+    var lowT  = title.toLowerCase();
+    if (POLICY_EXCLUDE_TERMS.some(function(t) { return lowT.indexOf(t.trim()) !== -1; })) return;
+
+    var link = String(r.link || '');
+    if (link && link.charAt(0) === '/') link = 'https://www.gov.uk' + link;
+
+    var item = {
+      category       : '유럽',
+      country        : '영국',
+      source         : 'GOV.UK (HMRC/Tribunal)',
+      ruling_number  : '',
+      hs_code        : '',
+      product_name   : '',
+      product_name_en: '',
+      company        : _detectCompany(title + ' ' + (r.description || '')),
+      title          : '',
+      title_en       : title,
+      summary        : String(r.description || '').substring(0, 250),
+      issue_date     : (d && !isNaN(d.getTime())) ? _fmtDate(d) : '',
+      url            : link,
+      url_source     : 'GOV.UK',
+      url_status     : link ? URL_STATUS_OFFICIAL : '',
+      provenance     : '공식'
+    };
+    item.importance = _autoImportance(item);
+    out.push(item);
+  });
+  return out;
+}
+
+/**
+ * 뉴스 RSS 직수집 (Google News RSS + 전문지 RSS).
+ * Gemini와 달리 쿼리 결과를 결정적으로 전부 반환하므로, 지역 뉴스 커버리지의 바닥을 보장한다.
+ * Google News 링크는 리다이렉트 URL이며 _verifyItemUrls가 최종 기사 URL로 해소한다.
+ */
+function _collectRssNews(periodStart) {
+  var reqs = RSS_SOURCES.map(function(s) {
+    return { url: s.url, method: 'get', muteHttpExceptions: true };
+  });
+  var resps = _fetchAllInBatches(reqs);
+
+  var out = [];
+  resps.forEach(function(resp, i) {
+    var src = RSS_SOURCES[i];
+    if (!resp || resp.getResponseCode() !== 200) {
+      Logger.log('[RSS] ' + src.name + ' HTTP ' + (resp ? resp.getResponseCode() : '없음'));
+      return;
+    }
+    var items;
+    try {
+      var root    = XmlService.parse(resp.getContentText()).getRootElement();
+      var channel = root.getChild('channel');
+      items = channel ? channel.getChildren('item') : [];
+    } catch (e) {
+      Logger.log('[RSS] ' + src.name + ' 파싱 오류: ' + e.message);
+      return;
+    }
+
+    var kept = 0;
+    for (var j = 0; j < items.length && kept < RSS_MAX_PER_FEED; j++) {
+      var el    = items[j];
+      var title = String(el.getChildText('title') || '').trim();
+      var link  = String(el.getChildText('link') || '').trim();
+      var pub   = String(el.getChildText('pubDate') || '').trim();
+      var desc  = String(el.getChildText('description') || '')
+                    .replace(/<[^>]*>/g, ' ').replace(/&[a-z#0-9]+;/gi, ' ')
+                    .replace(/\s+/g, ' ').trim();
+      if (!title || !link) continue;
+
+      var d = pub ? new Date(pub) : null;
+      if (d && !isNaN(d.getTime()) && d < periodStart) continue;       // 기간 밖
+      if (src.filter && !src.filter.test(title)) continue;              // 범용 피드는 제목 필터
+      var lowT = title.toLowerCase();
+      if (POLICY_EXCLUDE_TERMS.some(function(t) { return lowT.indexOf(t.trim()) !== -1; })) continue;
+
+      kept++;
+      var item = {
+        category       : src.category,
+        country        : src.country,
+        source         : src.name,
+        ruling_number  : '',
+        hs_code        : '',
+        product_name   : '',
+        product_name_en: '',
+        company        : _detectCompany(title + ' ' + desc),
+        title          : src.ko ? title : '',
+        title_en       : src.ko ? '' : title,
+        summary        : desc.substring(0, 200),
+        issue_date     : (d && !isNaN(d.getTime())) ? _fmtDate(d) : '',
+        url            : link,
+        url_source     : src.name,
+        url_status     : '',
+        provenance     : '뉴스RSS'
+      };
+      item.importance = _autoImportance(item);
+      out.push(item);
+    }
   });
   return out;
 }
@@ -1933,8 +2130,9 @@ function _buildItemCard(item) {
   var impBg    = IMPORTANCE_BG[imp];
 
   var badges = _badge('중요도 ' + imp, impColor, impBg, impColor);
-  // 출처유형: 공식(검증) vs AI검색 — 신뢰도 구분. 원문 URL 미확인 항목은 '미검증'을 별도 표기.
+  // 출처유형: 공식(검증) / 뉴스RSS / AI검색 — 신뢰도 구분. 원문 URL 미확인 항목은 '미검증'을 별도 표기.
   if (item.provenance === '공식') badges += _badge('공식·검증', '#1b5e3b', '#e7f4ec', '#bfe0cc');
+  else if (item.provenance === '뉴스RSS') badges += _badge('뉴스·RSS', '#0d5c63', '#e4f3f4', '#bcdfe2');
   else if (item.provenance === 'AI검색') badges += _badge('AI검색', '#6d3b00', '#fbf0e3', '#e7cfb0');
   if (item.unverified || String(item.url_status || '') === '미검증') {
     badges += _badge('원문 미확인', '#8a6d00', '#fdf8e3', '#e8d98a');
@@ -2282,6 +2480,28 @@ function testEuEurlex() {
     var resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
     Logger.log('  endpoint HTTP ' + resp.getResponseCode() + ': ' + resp.getContentText().substring(0, 400));
   }
+}
+
+/** 뉴스 RSS 직수집 확인용 — 피드별 수집 건수와 샘플을 로그로 출력 */
+function testRssNews() {
+  EXEC_START_MS = new Date().getTime();
+  var items = _collectRssNews(new Date(Date.now() - MONITORING_DAYS * 24 * 60 * 60 * 1000));
+  Logger.log('[testRssNews] 총 ' + items.length + '건 (' + RSS_SOURCES.length + '개 피드)');
+  var byFeed = {};
+  items.forEach(function(it) { byFeed[it.source] = (byFeed[it.source] || 0) + 1; });
+  Object.keys(byFeed).forEach(function(k) { Logger.log('  ' + k + ': ' + byFeed[k] + '건'); });
+  items.slice(0, 8).forEach(function(it) {
+    Logger.log('  - [' + it.country + '] ' + (it.title || it.title_en) + ' | ' + it.issue_date);
+  });
+}
+
+/** GOV.UK Search API 직수집 확인용 */
+function testGovUk() {
+  var items = _collectGovUkDecisions(new Date(Date.now() - 90 * 24 * 60 * 60 * 1000));
+  Logger.log('[testGovUk] 최근 90일 ' + items.length + '건');
+  items.slice(0, 8).forEach(function(it) {
+    Logger.log('  - ' + it.title_en + ' | ' + it.issue_date + ' | ' + it.url);
+  });
 }
 
 /**

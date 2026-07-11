@@ -5,6 +5,17 @@ HS 품목분류 유권해석 사례를 주간 수집하여 구글 시트에 저�
 
 - 메인 스크립트: [`hs-ruling-monitor.gs`](hs-ruling-monitor.gs)
 
+## v4.6 — 직수집기 추가 (뉴스 RSS 14피드 + GOV.UK API)
+
+Gemini에 의존하지 않는 결정적(deterministic) 수집 경로를 2종 추가.
+
+- **Google News RSS 직수집**: 국가·현지어별 14개 피드(한국어·일본어·중국어·베트남어·포르투갈어·
+  스페인어·터키어·러시아어·독일어·아랍어·영어 + 인도 Taxscan/TaxGuru RSS). 쿼리 결과를 전부
+  반환하므로 지역 뉴스 커버리지의 바닥을 보장. 리다이렉트 링크는 URL 검증 단계가 원문 기사 URL로 해소.
+- **英 GOV.UK Search API**: "tariff classification" 심판결정·가이던스, 영구 URL(공식 출처).
+- 출처유형 3단계(공식 / 뉴스·RSS / AI검색) 배지로 신뢰도 구분. 진단: `testRssNews()`, `testGovUk()`.
+- 토글: `USE_RSS_NEWS`, `USE_UK_GOVUK` / 피드 목록: `RSS_SOURCES` (쿼리·언어 수정 가능).
+
 ## v4.5 — 프롬프트 전면 재설계 (그라운딩 검색 방식 최적화)
 
 "검색이 실제로 어떻게 동작하는가"에 맞춰 25→27개 패스의 프롬프트를 전부 재작성.
