@@ -2,6 +2,21 @@
  * HS Code 유권해석(Ruling) 주간 모니터링 시스템
  * ─────────────────────────────────────────────
  * [변경 이력]
+ * v4.5 (프롬프트 전면 재설계 — 그라운딩 검색 방식에 맞춤)
+ *  - [공통] SEARCH RULES 신설: 최소 5회 개별 검색 / 현지어 우선 / site: 연산자 활용 /
+ *      검색어에 제품·기업명 금지(넓게 검색 → 보고 단계에서 필터) / 날짜는 페이지 본문에서 확인
+ *  - [공통] A/B/C 수집조건을 '제외 필터'에서 '우선순위(중요도) 마커'로 전환 —
+ *      조건 미매칭 룰링도 중요도 '하'로 전부 보고 (모델 자기검열 제거, RECALL_MODE와 일관)
+ *  - [재조준] 구글에 색인되지 않는 소스를 찾게 하던 헛수고 패스 수정:
+ *      · EU(BTI) → EU(회원국): EBTI DB는 비색인 → 회원국 법원판결·로펌 얼럿 중심으로 재정의
+ *      · 캐나다: CBSA advance ruling 비공개 → CITT 심판 판결 중심
+ *      · 영국: HMRC ATaR 비공개 → First-tier Tribunal 판결 중심
+ *      · CIS: 정기 공표되는 EAEU(ЕЭК) 분류결정을 1차 소스로
+ *      · 한국(공식): CLIP 비색인 명시 → 보도자료·고시·행정예고 중심
+ *  - [분할] 고수율 지역 패스 확대: 인도 → 공식(CAAR/CESTAT)/전문지(TaxGuru·Taxscan) 2패스,
+ *      베트남 → 단독 패스 분리(분류 결정문 공개 활발) — 총 25 → 27개 패스
+ *  - 모든 지역 프롬프트를 '키워드 나열'에서 '번호 붙은 검색 전략(현지어 쿼리 명시)'으로 재작성
+ *
  * v4.4 (수집량 우선 모드 — "정보가 너무 안 잡힌다" 대응)
  *  - RECALL_MODE 도입 (기본 true): 스코프 재검사·URL 미검증을 이유로 항목을 버리지 않고
  *    '원문 미확인'/'모델판정' 태그로 구분만 한다 — Gemini 프롬프트의 MANDATORY GATE가 이미
@@ -256,41 +271,64 @@ var MONITORING_REGIONS = [
   // ── 동북아 ── (한국은 공식 DB / 뉴스·업계 2개 패스로 분할해 회수율 확대)
   {
     category: '동북아', region: '한국', countryName: '한국',
-    source  : '관세청 CLIP (관세평가분류원)',
-    prompt  : 'Search for OFFICIAL HS Code tariff classification decisions from South Korea published in the last {DAYS} days. ' +
-              'Focus on official sources: 관세법령정보포털 CLIP (unipass.customs.go.kr/clip) 품목분류 결정례, 관세평가분류원 품목분류 사전심사, 관세품목분류위원회 결정, 관세청 보도자료·고시. ' +
-              'Keywords: "품목분류 사전심사" "관세품목분류위원회 결정" "품목분류 결정례" "관세청 고시 품목분류" "HS 품목분류" "{YEAR}".'
+    source  : '관세청 (품목분류 고시·보도자료)',
+    prompt  : 'Goal: find ALL official Korean customs HS classification decisions published in the last {DAYS} days. ' +
+              'Search strategy (run each, IN KOREAN): ' +
+              '1) site:customs.go.kr 품목분류  ' +
+              '2) "관세품목분류위원회" 결정 {YEAR}  ' +
+              '3) "품목분류 사전심사" 결정  ' +
+              '4) 관세평가분류원 품목분류  ' +
+              '5) 품목분류 변경 고시 행정예고. ' +
+              'Note: the CLIP database (unipass.customs.go.kr) is behind a search form and NOT indexed by Google — ' +
+              'do not expect direct ruling pages; press releases, 고시/행정예고 notices and attached PDFs are the findable sources.'
   },
   {
     category: '동북아', region: '한국(뉴스)', countryName: '한국',
     source  : '한국 관세 전문지·업계 보도',
-    prompt  : 'Search Korean customs news and trade press for HS Code tariff classification ruling CASES reported in the last {DAYS} days. ' +
-              'Look in: 한국관세신문, 관세무역신문, 조세일보, 법률신문, 관세법인·로펌 뉴스레터, and any Korean media reporting classification decisions, 조세심판원 품목분류 심판, or court rulings on HS classification. ' +
-              'Keywords: "품목분류 쟁송" "HS코드 유권해석" "품목분류 심판청구" "조세심판원 품목분류" "관세 분류 소송" "스마트폰" "에어컨" "삼성전자" "LG전자" "{YEAR}".'
+    prompt  : 'Goal: find Korean HS classification ruling CASES reported by news/trade press in the last {DAYS} days. ' +
+              'Search strategy (run each, IN KOREAN): ' +
+              '1) 품목분류 쟁송 OR 심판 OR 소송 {YEAR}  ' +
+              '2) 조세심판원 품목분류 결정  ' +
+              '3) 대법원 OR 고등법원 품목분류 판결  ' +
+              '4) HS코드 분류 결정 (한국관세신문, 관세무역신문 등 전문지)  ' +
+              '5) 관세법인 OR 로펌 뉴스레터 품목분류. ' +
+              'These are indexed news sources — report every distinct case found.'
   },
   {
     category: '동북아', region: '일본',
-    source  : 'Japan Customs 사전교시 DB',
-    prompt  : 'Search for HS Code tariff classification rulings from Japan published in the last {DAYS} days. ' +
-              'Look broadly in: Japan Customs 事前教示回答事例 (customs.go.jp), Japanese customs news, trade publications, and any web source reporting on Japanese customs rulings. ' +
-              'Keywords: "事前教示" "関税分類" "品目分類" "税関 分類事例" "スマートフォン" "エアコン" "Samsung" "Apple" "Japan tariff classification ruling {YEAR}". ' +
-              'Do NOT limit results to official DB only — news articles and trade reports are acceptable.'
+    source  : 'Japan Customs 사전교시(事前教示)',
+    prompt  : 'Goal: find ALL Japanese customs advance classification rulings (事前教示) and classification decisions published in the last {DAYS} days. ' +
+              'Search strategy (run each, IN JAPANESE): ' +
+              '1) site:customs.go.jp 事前教示 回答事例  ' +
+              '2) 事前教示 品目分類 {YEAR}  ' +
+              '3) 関税分類 決定 {YEAR}  ' +
+              '4) 税関 品目分類 変更  ' +
+              '5) English supplement: Japan customs classification ruling {YEAR}. ' +
+              'The 事前教示回答事例 pages on customs.go.jp are public HTML — site: searches can surface individual rulings.'
   },
 
   // ── 중국 ── (공식 归类决定 / 뉴스·업계 2개 패스로 분할)
   {
     category: '중국', region: '중국', countryName: '중국',
     source  : '中国海关总署 归类决定',
-    prompt  : 'Search for OFFICIAL Chinese customs classification decisions (归类决定 / 商品归类) published in the last {DAYS} days. ' +
-              'Focus on: 海关总署公告 announcing 归类决定, customs.gov.cn, 中国海关杂志, 12360海关热线 classification notices. ' +
-              'Keywords: "海关总署公告 归类决定" "商品归类决定" "税则归类" "归类指南" "{YEAR}".'
+    prompt  : 'Goal: find ALL official Chinese customs classification decisions (归类决定 / 商品归类) published in the last {DAYS} days. ' +
+              'Search strategy (run each, IN CHINESE): ' +
+              '1) site:customs.gov.cn 归类 公告  ' +
+              '2) 海关总署公告 {YEAR} 归类决定  ' +
+              '3) 商品归类决定 {YEAR}  ' +
+              '4) 税则归类 裁定  ' +
+              '5) English supplement: China customs classification decision announcement {YEAR}.'
   },
   {
     category: '중국', region: '중국(뉴스)', countryName: '중국',
     source  : '중국 관세·무역 전문지',
-    prompt  : 'Search Chinese trade press and customs consulting news for HS classification ruling cases reported in the last {DAYS} days. ' +
-              'Look in: Chinese trade news, customs broker/law firm alerts (KPMG/PwC China trade alerts, 关务小二, 云关通), WTO notifications, and any source reporting Chinese customs classification disputes or decisions. ' +
-              'Keywords: "商品归类 案例" "归类争议" "海关 归类 处罚" "智能手机 归类" "空调 归类" "Samsung" "Huawei" "Apple" "China HS classification {YEAR}".'
+    prompt  : 'Goal: find Chinese HS classification ruling CASES reported by trade press, customs brokers, or law firms in the last {DAYS} days. ' +
+              'Search strategy (run each, IN CHINESE): ' +
+              '1) 商品归类 案例 {YEAR}  ' +
+              '2) 归类争议 OR 归类差错 海关  ' +
+              '3) 海关 归类 行政处罚 案例  ' +
+              '4) 关务 归类 (关务小二, 云关通 등 실무 매체)  ' +
+              '5) English supplement: China customs classification dispute {YEAR} (KPMG/PwC China trade alerts).'
   },
 
   // ── 북미 ──
@@ -298,101 +336,149 @@ var MONITORING_REGIONS = [
     category: '북미', region: '미국',
     source  : 'U.S. CIT/CAFC 품목분류 판결 (CROSS는 API 직수집)',
     // ※ 일상적 CROSS 결정은 CBP API로 전수 수집하므로, 여기서는 그 外 '분류 판결'만 보완
-    prompt  : 'Search ONLY for actual HS tariff CLASSIFICATION ruling cases or court decisions from the US in the last {DAYS} days, EXCLUDING routine CBP CROSS ruling letters (collected separately). ' +
-              'Collect ONLY: Court of International Trade (CIT) or Federal Circuit (CAFC) JUDGMENTS that decide the correct HTSUS classification of a specific product, and formal classification disputes that turn on which HTS heading applies. ' +
-              'STRICTLY EXCLUDE general trade-policy items: Section 301/232/201 actions, tariff-rate or duty-rate changes, antidumping/countervailing duties, quotas, fees, FTA/origin, sanctions, export controls. ' +
-              'Look in: cit.uscourts.gov, cafc.uscourts.gov, Sandler Travis, law firm trade alerts, Lexology, Law360. ' +
-              'Keywords: "CIT tariff classification decision" "CAFC HTSUS classification holding" "proper classification under heading" "smartphone" "air conditioner" "Samsung" "Apple" "LG" "{YEAR}". ' +
-              'Each result MUST be about how a specific product is classified (an HTS heading/subheading determination), not a tariff-rate or policy measure.'
+    prompt  : 'Goal: find US COURT decisions on HTSUS tariff classification in the last {DAYS} days, EXCLUDING routine CBP CROSS ruling letters (collected separately via API). ' +
+              'Search strategy (run each): ' +
+              '1) site:cit.uscourts.gov classification slip opinion {YEAR}  ' +
+              '2) Court of International Trade "tariff classification" decision {YEAR}  ' +
+              '3) CAFC HTSUS classification opinion  ' +
+              '4) Lexology OR Mondaq US tariff classification court  ' +
+              '5) customs classification litigation news {YEAR}. ' +
+              'Each result MUST decide how a specific product is classified (HTS heading determination), not a tariff-rate or policy measure.'
   },
   {
     category: '북미', region: '캐나다',
-    source  : 'CBSA National Tariff Classification Rulings',
-    prompt  : 'Search for HS Code tariff classification rulings from Canada published in the last {DAYS} days. ' +
-              'Look broadly in: CBSA advance rulings (cbsa-asfc.gc.ca), CITT appeal decisions, Canadian customs news, trade publications, and any web source reporting on Canadian customs rulings. ' +
-              'Keywords: "CBSA tariff classification advance ruling" "CITT appeal tariff" "Canada customs classification" "smartphone" "Samsung" "Apple" "LG" "{YEAR}". ' +
-              'Do NOT limit results to official DB only — news articles and trade reports are acceptable.'
+    source  : 'CITT 분류 심판 / 캐나다 관세 보도',
+    prompt  : 'Goal: find Canadian tariff classification decisions in the last {DAYS} days — primarily CITT (Canadian International Trade Tribunal) appeal decisions. ' +
+              'Search strategy (run each): ' +
+              '1) site:citt-tcce.gc.ca tariff classification appeal {YEAR}  ' +
+              '2) CITT decision tariff classification  ' +
+              '3) Canada customs classification appeal news  ' +
+              '4) Canadian trade law firm alert tariff classification  ' +
+              '5) French: TCCE décision classement tarifaire. ' +
+              'Note: CBSA advance rulings are NOT published individually — tribunal decisions and professional press are the findable sources.'
   },
 
   // ── 중남미 ──
   {
     category: '중남미', region: '멕시코',
-    source  : 'SAT Mexico',
-    prompt  : 'Search for HS Code tariff classification rulings from Mexico published in the last {DAYS} days. ' +
-              'Look broadly in: SAT Mexico (sat.gob.mx), ANAM, Diario Oficial de la Federación, Mexican trade news, customs publications, and any web source reporting on Mexican customs rulings. ' +
-              'Keywords: "SAT clasificación arancelaria" "fracción arancelaria México" "TIGIE" "criterio de clasificación" "smartphone" "teléfono celular" "Samsung" "Apple" "Mexico tariff classification {YEAR}". ' +
-              'Do NOT limit results to official DB only — news articles and trade reports are acceptable.'
+    source  : 'SAT / DOF (관보)',
+    prompt  : 'Goal: find ALL Mexican tariff classification decisions (criterios de clasificación arancelaria) published in the last {DAYS} days. ' +
+              'Search strategy (run each, IN SPANISH): ' +
+              '1) site:dof.gob.mx clasificación arancelaria criterio  ' +
+              '2) SAT criterios de clasificación arancelaria {YEAR}  ' +
+              '3) ANAM clasificación arancelaria resolución  ' +
+              '4) noticias clasificación arancelaria México TIGIE  ' +
+              '5) English supplement: Mexico tariff classification decision {YEAR}.'
   },
   {
     category: '중남미', region: '브라질',
-    source  : 'Receita Federal do Brasil (RFB)',
-    prompt  : 'Search for HS Code tariff classification rulings from Brazil published in the last {DAYS} days. ' +
-              'Look broadly in: Receita Federal Soluções de Consulta (normas.receita.fazenda.gov.br), Brazilian trade news, NCM updates, and any web source reporting on Brazilian customs classification. ' +
-              'Keywords: "Solução de Consulta classificação fiscal NCM" "Receita Federal NCM" "smartphone" "telefone celular" "Samsung" "Apple" "Brazil tariff classification {YEAR}". ' +
-              'Do NOT limit results to official DB only — news articles and trade reports are acceptable.'
+    source  : 'Receita Federal — Soluções de Consulta',
+    prompt  : 'Goal: find ALL Brazilian NCM classification decisions (Soluções de Consulta sobre classificação fiscal de mercadorias) published in the last {DAYS} days. ' +
+              'Search strategy (run each, IN PORTUGUESE): ' +
+              '1) site:normas.receita.fazenda.gov.br "Solução de Consulta" classificação  ' +
+              '2) "Solução de Consulta" "classificação fiscal de mercadorias" {YEAR}  ' +
+              '3) Receita Federal NCM classificação decisão  ' +
+              '4) notícias classificação NCM {YEAR}  ' +
+              '5) English supplement: Brazil NCM classification ruling {YEAR}. ' +
+              'Soluções de Consulta are published as indexed HTML on normas.receita.fazenda.gov.br — report every one about classification.'
   },
   {
     category: '중남미', region: '콜롬비아',
-    source  : 'DIAN Colombia',
-    prompt  : 'Search for HS Code tariff classification rulings from Colombia published in the last {DAYS} days. ' +
-              'Look broadly in: DIAN Colombia (dian.gov.co) clasificación arancelaria resolutions, Colombian customs news, trade publications. ' +
-              'Keywords: "DIAN resolución clasificación arancelaria Colombia" "arancel Colombia aduanas" "Colombia tariff classification ruling {YEAR}" "smartphone" "Samsung" "Apple". ' +
-              'Do NOT limit results to official DB only — news articles and trade reports are acceptable.'
+    source  : 'DIAN — Resoluciones de clasificación',
+    prompt  : 'Goal: find ALL Colombian tariff classification resolutions published in the last {DAYS} days. ' +
+              'Search strategy (run each, IN SPANISH): ' +
+              '1) site:dian.gov.co resolución clasificación arancelaria  ' +
+              '2) DIAN clasificación arancelaria {YEAR}  ' +
+              '3) noticias Colombia clasificación arancelaria resolución  ' +
+              '4) English supplement: Colombia tariff classification ruling {YEAR}.'
   },
   {
     category: '중남미', region: '페루',
-    source  : 'SUNAT Peru',
-    prompt  : 'Search for HS Code tariff classification rulings from Peru published in the last {DAYS} days. ' +
-              'Look broadly in: SUNAT Peru (sunat.gob.pe) resoluciones de clasificación arancelaria, Peruvian customs news, trade publications. ' +
-              'Keywords: "SUNAT resolución clasificación arancelaria Perú" "INTA Perú arancel" "Peru tariff classification ruling {YEAR}" "smartphone" "Samsung" "Apple". ' +
-              'Do NOT limit results to official DB only — news articles and trade reports are acceptable.'
+    source  : 'SUNAT — Resoluciones de clasificación',
+    prompt  : 'Goal: find ALL Peruvian tariff classification resolutions published in the last {DAYS} days. ' +
+              'Search strategy (run each, IN SPANISH): ' +
+              '1) site:sunat.gob.pe clasificación arancelaria resolución  ' +
+              '2) SUNAT INTA resolución clasificación arancelaria {YEAR}  ' +
+              '3) noticias Perú clasificación arancelaria  ' +
+              '4) English supplement: Peru tariff classification ruling {YEAR}.'
   },
   {
     category: '중남미', region: '아르헨티나/칠레/파나마', isGroup: true,
     countries: ['아르헨티나', '칠레', '파나마'],
     source  : 'ARCA(아르헨티나) / Aduana Chile / ANA(파나마)',
-    prompt  : 'Search for HS Code tariff classification rulings from Argentina, Chile, or Panama published in the last {DAYS} days. ' +
-              'Look broadly in: Argentina ARCA/AFIP (afip.gob.ar), Chile Customs (aduana.cl) resoluciones de clasificación, Panama ANA (ana.gob.pa), and any web source reporting on these countries\' customs rulings. ' +
-              'Keywords: "clasificación arancelaria Argentina" "Aduana Chile resolución clasificación" "ANA Panamá arancel" "smartphone" "Samsung" "Apple" "tariff classification ruling {YEAR}". ' +
-              'Do NOT limit results to official DB only — news articles and trade reports are acceptable. ' +
+    prompt  : 'Goal: find tariff classification decisions from Argentina, Chile, or Panama published in the last {DAYS} days. ' +
+              'Search strategy (run each, IN SPANISH): ' +
+              '1) Argentina resolución clasificación arancelaria {YEAR}  ' +
+              '2) site:aduana.cl resolución clasificación  ' +
+              '3) Chile aduana clasificación arancelaria dictamen  ' +
+              '4) Panamá ANA clasificación arancelaria resolución  ' +
+              '5) English news sweep: Argentina OR Chile OR Panama tariff classification {YEAR}. ' +
               'Use the actual country name (아르헨티나 / 칠레 / 파나마) in the country field for each ruling found.'
   },
 
-  // ── 인도 ──
+  // ── 인도 ── (공식 CAAR·CESTAT / 세무 전문지 2개 패스 — 인도는 룰링 기사화가 활발한 고수율 지역)
   {
-    category: '인도', region: '인도',
-    source  : 'India CBIC / Customs Authority for Advance Rulings',
-    prompt  : 'Search for HS Code tariff classification rulings from India published in the last {DAYS} days. ' +
-              'Look broadly in: CBIC (cbic.gov.in), Customs Authority for Advance Rulings (CAAR Mumbai / CAAR Delhi), CESTAT classification decisions, customs circulars, TaxGuru, Taxscan, trade news. ' +
-              'Keywords: "CAAR advance ruling classification" "CESTAT classification" "CBIC circular classification" "HSN classification India" "customs tariff heading" "smartphone" "air conditioner" "Samsung" "Apple" "LG" "India ruling {YEAR}". ' +
-              'Do NOT limit results to official DB only — news articles and trade reports are acceptable.'
+    category: '인도', region: '인도', countryName: '인도',
+    source  : 'India CAAR / CESTAT',
+    prompt  : 'Goal: find ALL Indian customs classification rulings in the last {DAYS} days — CAAR (Customs Authority for Advance Rulings, Mumbai/Delhi) advance rulings and CESTAT classification decisions. ' +
+              'Search strategy (run each): ' +
+              '1) CAAR Mumbai OR Delhi advance ruling classification {YEAR}  ' +
+              '2) CESTAT customs classification decision {YEAR}  ' +
+              '3) site:cbic.gov.in classification advance ruling  ' +
+              '4) customs tariff heading dispute India {YEAR}  ' +
+              '5) CBIC circular classification {YEAR}.'
+  },
+  {
+    category: '인도', region: '인도(전문지)', countryName: '인도',
+    source  : 'TaxGuru / Taxscan / LiveLaw',
+    prompt  : 'Goal: find Indian HS/HSN classification ruling CASES reported by Indian tax/legal media in the last {DAYS} days. ' +
+              'These sites publish full texts of CAAR/CESTAT rulings and are well indexed. ' +
+              'Search strategy (run each): ' +
+              '1) site:taxguru.in CAAR classification ruling  ' +
+              '2) site:taxscan.in customs classification  ' +
+              '3) site:livelaw.in customs classification CESTAT  ' +
+              '4) HSN classification ruling India {YEAR}  ' +
+              '5) advance ruling customs classification India news.'
   },
 
   // ── 유럽 ── (EU는 EUR-Lex 분류규칙을 API로도 직수집하며, Gemini는 2개 보완 패스로 분리)
   {
     category: '유럽', region: 'EU',
     source  : 'EU 분류규칙(Official Journal) / CJEU 판결',
-    prompt  : 'Search for EU HS tariff CLASSIFICATION acts published in the last {DAYS} days. ' +
-              'Focus on: (1) Commission Implementing Regulations "concerning the classification of certain goods in the Combined Nomenclature" in the EU Official Journal (find them on EUR-Lex, eur-lex.europa.eu), and ' +
-              '(2) Court of Justice of the EU (CJEU) judgments deciding the CN/HS classification of a specific product (curia.europa.eu). ' +
-              'For each, capture the CELEX number (e.g. 32026Rxxxx) or case number (e.g. C-123/25) as ruling_number, the EUR-Lex/CURIA URL, the CN code, and the product. ' +
-              'Keywords: "classification of certain goods in the Combined Nomenclature" "Commission Implementing Regulation (EU) classification" "CJEU tariff classification judgment" "smartphone" "air conditioner" "monitor" "Samsung" "Apple" "{YEAR}".'
+    prompt  : 'Goal: find ALL EU classification acts in the last {DAYS} days — Commission Implementing Regulations on CN classification and CJEU classification judgments. ' +
+              'Search strategy (run each): ' +
+              '1) site:eur-lex.europa.eu "classification of certain goods in the Combined Nomenclature" {YEAR}  ' +
+              '2) Official Journal Commission Implementing Regulation classification {YEAR}  ' +
+              '3) site:curia.europa.eu Combined Nomenclature judgment  ' +
+              '4) CJEU tariff classification judgment {YEAR}  ' +
+              '5) EU customs classification regulation news. ' +
+              'Capture the CELEX number (e.g. 3{YEAR}Rxxxx) or case number (e.g. C-123/25) as ruling_number, the EUR-Lex/CURIA URL, and the CN code.'
   },
   {
-    category: '유럽', region: 'EU(BTI)', countryName: 'EU',
-    source  : 'EU EBTI / 회원국 BTI (Binding Tariff Information)',
-    prompt  : 'Search for newly issued EU Binding Tariff Information (BTI/EBTI) rulings and EU member-state customs classification decisions in the last {DAYS} days. ' +
-              'Look in: the EU EBTI public database (ec.europa.eu/taxation_customs/dds2/ebti), German (Verbindliche Zolltarifauskunft / vZTA), French, Dutch, and other member-state customs BTI rulings, and EU customs trade press. ' +
-              'For each, capture the BTI reference (e.g. DEBTIxxxxx) as ruling_number, the CN code, the product, and the issuing member state (put it in title_en, keep country as EU). ' +
-              'Keywords: "Binding Tariff Information" "verbindliche Zolltarifauskunft" "EBTI reference" "renseignement tarifaire contraignant" "smartphone" "earbuds" "air conditioner" "Samsung" "Apple" "{YEAR}".'
+    category: '유럽', region: 'EU(회원국)', countryName: 'EU',
+    source  : 'EU 회원국 분류 판결·분쟁 / 로펌 얼럿',
+    prompt  : 'Goal: find EU MEMBER-STATE customs classification court decisions, disputes, and professional alerts in the last {DAYS} days. ' +
+              'Search strategy (run each): ' +
+              '1) Lexology OR Mondaq EU tariff classification BTI {YEAR}  ' +
+              '2) German: Zolltarif Einreihung Urteil Finanzgericht {YEAR}  ' +
+              '3) Dutch: indeling gecombineerde nomenclatuur uitspraak  ' +
+              '4) French: classement tarifaire arrêt douane  ' +
+              '5) EU customs classification dispute news {YEAR}. ' +
+              'Note: the EBTI database itself is behind a search form and NOT indexed by Google — court decisions, ' +
+              'national customs bulletins and law-firm alerts are the findable sources. ' +
+              'Put the member state name in title_en; keep country as EU.'
   },
   {
     category: '유럽', region: '영국',
-    source  : 'UK HMRC ADD (Advance Tariff Ruling)',
-    prompt  : 'Search for HS Code tariff classification rulings from the United Kingdom published in the last {DAYS} days. ' +
-              'Look broadly in: UK HMRC Advance Tariff Rulings, UK Trade Tariff (trade-tariff.service.gov.uk), First-tier Tribunal tariff classification decisions, UK customs news, trade publications. ' +
-              'Keywords: "UK HMRC advance tariff ruling" "UK commodity code classification" "tribunal tariff classification UK" "smartphone" "Samsung" "Apple" "UK tariff ruling {YEAR}". ' +
-              'Do NOT limit results to official DB only — news articles and trade reports are acceptable.'
+    source  : 'UK First-tier Tribunal 분류 판결',
+    prompt  : 'Goal: find UK tariff classification decisions in the last {DAYS} days — primarily First-tier Tribunal (Tax Chamber) and Upper Tribunal customs classification judgments. ' +
+              'Search strategy (run each): ' +
+              '1) First-tier Tribunal tariff classification decision {YEAR}  ' +
+              '2) site:gov.uk tribunal customs classification decision  ' +
+              '3) site:bailii.org customs tariff classification  ' +
+              '4) UK commodity code classification appeal news  ' +
+              '5) UK customs classification law firm alert {YEAR}. ' +
+              'Note: HMRC Advance Tariff Rulings are NOT published individually — tribunal judgments and professional press are the findable sources.'
   },
 
   // ── 중동 ──
@@ -400,31 +486,38 @@ var MONITORING_REGIONS = [
     category: '중동', region: '사우디아라비아/UAE', isGroup: true,
     countries: ['사우디아라비아', 'UAE'],
     source  : 'ZATCA(사우디) / UAE FCA',
-    prompt  : 'Search for HS Code tariff classification rulings from Saudi Arabia or UAE published in the last {DAYS} days. ' +
-              'Look broadly in: Saudi ZATCA (zatca.gov.sa), UAE Federal Customs Authority, Dubai Customs, GCC customs news, trade publications, and any web source reporting on these countries\' customs rulings. ' +
-              'Keywords: "ZATCA tariff classification Saudi" "Dubai Customs HS classification" "GCC tariff ruling" "تصنيف جمركي" "smartphone" "Samsung" "Apple" "Huawei" "{YEAR}". ' +
-              'Do NOT limit results to official DB only — news articles and trade reports are acceptable. ' +
+    prompt  : 'Goal: find tariff classification decisions or reported cases from Saudi Arabia or UAE in the last {DAYS} days. ' +
+              'Search strategy (run each): ' +
+              '1) Arabic: تصنيف جمركي قرار {YEAR}  ' +
+              '2) ZATCA classification decision news  ' +
+              '3) Dubai Customs classification notice  ' +
+              '4) GCC customs classification news {YEAR}  ' +
+              '5) English: Saudi OR UAE customs classification ruling. ' +
               'Use the actual country name (사우디아라비아 / UAE) in the country field.'
   },
   {
     category: '중동', region: '튀르키예',
-    source  : 'Turkish Ministry of Trade (Ticaret Bakanlığı)',
-    prompt  : 'Search for HS Code tariff classification rulings from Turkey published in the last {DAYS} days. ' +
-              'Look broadly in: Turkish Ministry of Trade (ticaret.gov.tr), Gümrükler Genel Müdürlüğü, Bağlayıcı Tarife Bilgisi (BTB), Turkish customs news, trade publications. ' +
-              'Keywords: "bağlayıcı tarife bilgisi" "gümrük tarife sınıflandırması" "tarife kararı" "Turkey customs classification ruling {YEAR}" "smartphone" "Samsung" "Apple". ' +
-              'Do NOT limit results to official DB only — news articles and trade reports are acceptable.'
+    source  : 'Ticaret Bakanlığı / 행정법원 판결',
+    prompt  : 'Goal: find Turkish tariff classification decisions in the last {DAYS} days. ' +
+              'Search strategy (run each, IN TURKISH): ' +
+              '1) bağlayıcı tarife bilgisi kararı {YEAR}  ' +
+              '2) gümrük tarife sınıflandırma kararı  ' +
+              '3) site:ticaret.gov.tr tarife sınıflandırma  ' +
+              '4) Danıştay gümrük tarife pozisyonu karar (행정법원 분류 판결)  ' +
+              '5) English supplement: Turkey customs classification ruling {YEAR}.'
   },
   {
     category: '중동', region: '이집트/요르단/이라크/모로코/파키스탄/이스라엘', isGroup: true,
     countries: ['이집트', '요르단', '이라크', '모로코', '튀니지', '알제리', '파키스탄', '이스라엘'],
     source  : '이집트 / 요르단 / 이라크 / 모로코 / 튀니지 / 알제리 / 파키스탄 / 이스라엘',
-    prompt  : 'Search for HS Code tariff classification rulings from any of these countries published in the last {DAYS} days: ' +
-              'Egypt, Jordan, Iraq, Morocco, Tunisia, Algeria, Pakistan, Israel. ' +
-              'Look broadly in official customs authorities and any web source (news, trade publications) reporting on customs rulings from these countries. ' +
-              'Keywords: "Egypt customs classification ruling" "Morocco ADII tariff" "Tunisia douane classification" "Algeria douane tariff" ' +
-              '"Pakistan FBR customs classification ruling" "Pakistan Customs Appellate Tribunal classification" "Israel customs tariff ruling" "Jordan customs classification" ' +
-              '"تصنيف جمركي" "classification tarifaire" "smartphone" "Samsung" "Apple". ' +
-              'Do NOT limit results to official DB only. ' +
+    prompt  : 'Goal: find tariff classification decisions or reported cases from Egypt, Jordan, Iraq, Morocco, Tunisia, Algeria, Pakistan, or Israel in the last {DAYS} days. ' +
+              'Search strategy (one search per language bloc, run each): ' +
+              '1) Arabic sweep: تصنيف جمركي قرار (Egypt/Jordan/Iraq)  ' +
+              '2) French sweep: classification tarifaire douane décision (Morocco/Tunisia/Algeria)  ' +
+              '3) Pakistan FBR classification ruling OR "Customs Appellate Tribunal" classification  ' +
+              '4) Israel customs classification ruling news  ' +
+              '5) English sweep: Middle East customs classification decision {YEAR}. ' +
+              'Most of these countries do not publish rulings — news and tribunal reports are the findable sources. ' +
               'Use the actual country name (이집트 / 요르단 / 이라크 / 모로코 / 튀니지 / 알제리 / 파키스탄 / 이스라엘) in the country field.'
   },
 
@@ -433,30 +526,49 @@ var MONITORING_REGIONS = [
     category: '동남아', region: '인도네시아/말레이시아/태국', isGroup: true,
     countries: ['인도네시아', '말레이시아', '태국'],
     source  : '인도네시아 Bea Cukai / 말레이시아 Royal Customs / 태국 Customs',
-    prompt  : 'Search for HS Code tariff classification rulings from Indonesia, Malaysia, or Thailand published in the last {DAYS} days. ' +
-              'Look broadly in: Indonesia Bea Cukai (beacukai.go.id) penetapan klasifikasi, Malaysia Customs (customs.gov.my) ketetapan kastam / customs ruling, Thailand Customs (customs.go.th) advance tariff ruling, ASEAN trade news. ' +
-              'Keywords: "penetapan klasifikasi barang Indonesia" "Malaysia customs ruling tariff classification" "Thailand advance tariff ruling" "smartphone" "Samsung" "Apple" "ASEAN tariff classification {YEAR}". ' +
-              'Do NOT limit results to official DB only — news articles and trade reports are acceptable. ' +
+    prompt  : 'Goal: find tariff classification decisions from Indonesia, Malaysia, or Thailand in the last {DAYS} days. ' +
+              'Search strategy (one search per country language, run each): ' +
+              '1) Indonesian: penetapan klasifikasi barang keputusan {YEAR} (site:beacukai.go.id 우선)  ' +
+              '2) Malay: ketetapan kastam penjenisan barang  ' +
+              '3) Thai: พิกัดศุลกากร คำวินิจฉัย  ' +
+              '4) English sweep: Indonesia OR Malaysia OR Thailand customs classification ruling {YEAR}  ' +
+              '5) ASEAN trade press classification news. ' +
               'Use the actual country name (인도네시아 / 말레이시아 / 태국) in the country field.'
   },
   {
-    category: '동남아', region: '베트남/필리핀/싱가포르', isGroup: true,
-    countries: ['베트남', '필리핀', '싱가포르'],
-    source  : '베트남 General Customs / 필리핀 BOC / 싱가포르 Customs',
-    prompt  : 'Search for HS Code tariff classification rulings from Vietnam, Philippines, or Singapore published in the last {DAYS} days. ' +
-              'Look broadly in: Vietnam Customs (customs.gov.vn) phân loại hàng hóa decisions, Philippines Tariff Commission / BOC tariff classification rulings, Singapore Customs (customs.gov.sg), ASEAN trade news. ' +
-              'Keywords: "quyết định phân loại hàng hóa" "Philippines tariff classification ruling" "Singapore customs classification" "smartphone" "Samsung" "Apple" "ASEAN tariff ruling {YEAR}". ' +
-              'Do NOT limit results to official DB only — news articles and trade reports are acceptable. ' +
-              'Use the actual country name (베트남 / 필리핀 / 싱가포르) in the country field.'
+    // 베트남은 분류 결정문(thông báo kết quả phân loại) 공개가 활발한 고수율 지역 — 단독 패스로 분리
+    category: '동남아', region: '베트남', countryName: '베트남',
+    source  : 'Vietnam Customs 분류 결정문',
+    prompt  : 'Goal: find ALL Vietnamese customs classification decisions in the last {DAYS} days. ' +
+              'Vietnam actively publishes classification result notices (thông báo kết quả phân loại) — search IN VIETNAMESE: ' +
+              '1) site:customs.gov.vn "phân loại" quyết định  ' +
+              '2) "thông báo kết quả phân loại" {YEAR}  ' +
+              '3) "quyết định phân loại hàng hóa" hải quan  ' +
+              '4) phân loại mã HS tranh chấp hải quan (분쟁·뉴스)  ' +
+              '5) English supplement: Vietnam customs classification decision {YEAR}.'
+  },
+  {
+    category: '동남아', region: '필리핀/싱가포르', isGroup: true,
+    countries: ['필리핀', '싱가포르'],
+    source  : '필리핀 Tariff Commission / 싱가포르 Customs',
+    prompt  : 'Goal: find tariff classification rulings from the Philippines or Singapore in the last {DAYS} days. ' +
+              'Search strategy (run each): ' +
+              '1) site:tariffcommission.gov.ph ruling classification  ' +
+              '2) Philippine tariff classification ruling {YEAR}  ' +
+              '3) Singapore customs classification news {YEAR}  ' +
+              '4) Philippines BOC classification decision news. ' +
+              'Use the actual country name (필리핀 / 싱가포르) in the country field.'
   },
   {
     category: '동남아', region: '호주/뉴질랜드', isGroup: true,
     countries: ['호주', '뉴질랜드'],
-    source  : 'Australian Border Force / New Zealand Customs',
-    prompt  : 'Search for HS Code tariff classification rulings from Australia or New Zealand published in the last {DAYS} days. ' +
-              'Look broadly in: ABF Australia tariff advice / Tariff Classification Gazette (abf.gov.au), New Zealand Customs rulings (customs.govt.nz), trade news. ' +
-              'Keywords: "Australia tariff advice classification" "ABF tariff classification gazette" "New Zealand customs tariff ruling" "smartphone" "Samsung" "Apple" "{YEAR}". ' +
-              'Do NOT limit results to official DB only — news articles and trade reports are acceptable. ' +
+    source  : 'ABF / AAT 심판 / NZ Customs',
+    prompt  : 'Goal: find tariff classification decisions from Australia or New Zealand in the last {DAYS} days. ' +
+              'Search strategy (run each): ' +
+              '1) site:abf.gov.au tariff classification (advice/gazette)  ' +
+              '2) AAT tribunal tariff classification decision {YEAR} (호주 행정심판 분류 판결)  ' +
+              '3) Australia tariff classification precedent news  ' +
+              '4) New Zealand customs classification ruling news {YEAR}. ' +
               'Use the actual country name (호주 / 뉴질랜드) in the country field.'
   },
 
@@ -465,22 +577,31 @@ var MONITORING_REGIONS = [
     category: '아프리카', region: '아프리카', isGroup: true,
     countries: ['남아프리카공화국', '나이지리아', '케냐'],
     source  : 'SARS(남아공) / Nigeria Customs / KRA(케냐)',
-    prompt  : 'Search for HS Code tariff classification rulings from South Africa, Nigeria, or Kenya published in the last {DAYS} days. ' +
-              'Look broadly in: SARS tariff determinations (sars.gov.za), Nigeria Customs (customs.gov.ng), Kenya KRA customs rulings (kra.go.ke), African trade news. ' +
-              'Keywords: "SARS tariff determination classification" "Nigeria customs HS code ruling" "Kenya KRA customs classification" "smartphone" "Samsung" "Apple" "Africa tariff ruling {YEAR}". ' +
-              'Do NOT limit results to official DB only — news articles and trade reports are acceptable. ' +
+    prompt  : 'Goal: find tariff classification decisions or reported cases from South Africa, Nigeria, or Kenya in the last {DAYS} days. ' +
+              'Search strategy (run each): ' +
+              '1) site:sars.gov.za tariff classification (determinations/letters)  ' +
+              '2) South Africa tariff classification court judgment {YEAR}  ' +
+              '3) Nigeria customs classification decision news  ' +
+              '4) Kenya KRA customs classification ruling news  ' +
+              '5) Africa customs classification dispute {YEAR}. ' +
+              'Most rulings are not published individually — court judgments and news are the findable sources. ' +
               'Use the actual country name (남아프리카공화국 / 나이지리아 / 케냐) in the country field.'
   },
 
-  // ── CIS ──
+  // ── CIS ── (개별 결정은 비공개가 많음 — 정기 공표되는 EAEU(ЕЭК) 분류결정을 1차 소스로 재조준)
   {
     category: 'CIS', region: 'CIS', isGroup: true,
     countries: ['러시아', '카자흐스탄', '우즈베키스탄'],
-    source  : 'ФТС(러시아) / КГД(카자흐스탄) / ГТК(우즈베키스탄)',
-    prompt  : 'Search for HS Code tariff classification rulings from Russia, Kazakhstan, or Uzbekistan published in the last {DAYS} days. ' +
-              'Look broadly in: Russia FCS классификационные решения (customs.gov.ru), EAEU/ЕЭК classification decisions (eec.eaeunion.org), Kazakhstan KGD (kgd.gov.kz), Uzbekistan customs (customs.uz), CIS trade news. ' +
-              'Keywords: "классификационное решение ТН ВЭД" "решение ЕЭК классификация" "Kazakhstan customs tariff classification" "смартфон" "кондиционер" "Samsung" "Huawei" "Apple" "{YEAR}". ' +
-              'Do NOT limit results to official DB only — news articles and trade reports are acceptable. ' +
+    source  : 'EAEU(ЕЭК) 분류결정 / ФТС / КГД',
+    prompt  : 'Goal: find EAEU/CIS tariff classification decisions in the last {DAYS} days. ' +
+              'PRIMARY source: Eurasian Economic Commission (ЕЭК) classification decisions — published regularly and indexed. ' +
+              'Search strategy (run each, IN RUSSIAN): ' +
+              '1) site:eec.eaeunion.org классификации решение  ' +
+              '2) "решение Коллегии ЕЭК" классификация {YEAR}  ' +
+              '3) классификационное решение ТН ВЭД {YEAR}  ' +
+              '4) ФТС классификация товара решение новости  ' +
+              '5) English supplement: EAEU classification decision {YEAR}. ' +
+              'EAEU-wide decisions apply to all member states — use 러시아 as country for EAEU decisions unless a specific state is named. ' +
               'Use the actual country name (러시아 / 카자흐스탄 / 우즈베키스탄) in the country field.'
   },
 
@@ -489,10 +610,14 @@ var MONITORING_REGIONS = [
     category: '글로벌', region: '글로벌 통상언론/WCO', isGroup: true,
     countries: [],
     source  : 'WCO / 글로벌 통상 전문지 / 로펌 Trade Alert',
-    prompt  : 'Search global trade press, law firm alerts and WCO sources for NEW or notable HS / tariff classification rulings, disputes or court decisions from ANY country, published in the last {DAYS} days. ' +
-              'Look broadly in: WCO news (wcoomd.org), Lexology, Mondaq, Law360, Bloomberg Law, Reuters, Sandler Travis trade report, KPMG/EY/Deloitte/PwC trade & customs alerts, CustomsMobile, customs law firm newsletters. ' +
-              'Keywords: "tariff classification ruling" "HS code classification dispute" "customs classification decision court" "advance ruling classification" "smartphone" "air conditioner" "TV" "Samsung" "LG" "Apple" "{YEAR}". ' +
-              'Do NOT report items already covered by official customs DB monitoring (CBP CROSS routine weekly rulings) unless they are notable. ' +
+    prompt  : 'Goal: find NEW or notable HS/tariff classification rulings, disputes or court decisions from ANY country reported in the last {DAYS} days by global professional media. ' +
+              'Search strategy (run each): ' +
+              '1) site:lexology.com tariff classification ruling {YEAR}  ' +
+              '2) site:mondaq.com customs classification  ' +
+              '3) WCO HS classification decisions news  ' +
+              '4) customs classification dispute court decision {YEAR}  ' +
+              '5) trade alert tariff classification (KPMG OR EY OR Deloitte OR PwC OR "Sandler Travis"). ' +
+              'Do NOT report routine CBP CROSS ruling letters (collected separately). ' +
               'Use the actual country name in KOREAN in the country field (예: 미국, 독일, 인도, 베트남).'
   }
 
@@ -1484,6 +1609,12 @@ function _buildRequest(region, apiKey, dateRangeStr, year) {
     dateRangeStr + ' (last ' + MONITORING_DAYS + ' days). ' +
     'Rulings ISSUED earlier but newly REPORTED/PUBLISHED within this period are also acceptable.\n\n' +
 
+    '[ SEARCH RULES — critical for finding results ]\n' +
+    '1. Run AT LEAST 5 SEPARATE searches, following the numbered search strategy in the target section above.\n' +
+    '2. Search in the LOCAL LANGUAGE of the target country FIRST (Korean, Japanese, Chinese, Portuguese, Spanish, Vietnamese, Russian, Turkish, Arabic...). Add 1-2 English searches only as a supplement.\n' +
+    '3. Keep search queries BROAD: search for ALL recent classification decisions from the authority. Do NOT put product names or company names into the search queries — they are reporting filters, not search filters. Narrow queries return nothing.\n' +
+    '4. Google cannot filter by date. Determine each item\'s date from the page content itself, and prefer items dated within the period.\n\n' +
+
     '[ MANDATORY GATE — collect ONLY genuine HS classification rulings ]\n' +
     'Every item MUST be a specific HS/tariff CLASSIFICATION decision — i.e. a customs authority advance/binding classification ruling, ' +
     'a classification determination, or a court/tribunal judgment deciding which HS heading/subheading a specific product falls under. ' +
@@ -1493,9 +1624,12 @@ function _buildRequest(region, apiKey, dateRangeStr, year) {
     'quotas, customs fees, drawback, de minimis, FTA/preferential-origin or rules-of-origin, export controls, sanctions, ' +
     'general trade statistics, agendas, or meeting/comment notices. If an item is not a product classification ruling, DO NOT include it.\n\n' +
 
-    '[ COLLECTION CRITERIA — OR condition (applied AFTER the mandatory gate above) ]\n\n' +
+    '[ PRIORITY CRITERIA — importance markers, NOT exclusion filters ]\n' +
+    'Report EVERY genuine classification ruling that passes the mandatory gate above. The lists below only set ' +
+    'PRIORITY (importance) — NEVER omit a classification ruling merely because it matches none of them; ' +
+    'such rulings are still wanted, with importance "하".\n\n' +
 
-    '▶ A. Collect if the ruling relates to ANY of the following products:\n' +
+    '▶ A. High priority if the ruling relates to ANY of the following products:\n' +
     '   Smartphone, mobile phone, tablet, smartwatch, smart glasses, Bluetooth earphones, earbuds,\n' +
     '   air conditioner, heat pump, chiller, oven, refrigerator, vacuum cleaner,\n' +
     '   TV, television, monitor, soundbar, interactive whiteboard (electronic whiteboard),\n' +
@@ -1503,11 +1637,11 @@ function _buildRequest(region, apiKey, dateRangeStr, year) {
     '   mock-up (display model / non-functional sample),\n' +
     '   5G base station, antenna, wireless communication equipment, X-ray equipment, medical imaging device\n\n' +
 
-    '▶ B. Collect if ANY of the following companies is mentioned as applicant or related party:\n' +
+    '▶ B. Highest priority if ANY of the following companies is mentioned as applicant or related party:\n' +
     '   Apple, Samsung, LG Electronics, Huawei, Xiaomi, Oppo, Vivo,\n' +
     '   Whirlpool, General Electric, Haier\n\n' +
 
-    '▶ C. Collect if the ruling involves a product classified under HS Chapter 39, 40, 42, 72, 73, 83, 84, 85, 90, 91 or 94\n\n' +
+    '▶ C. Also relevant if the ruling involves a product classified under HS Chapter 39, 40, 42, 72, 73, 83, 84, 85, 90, 91 or 94\n\n' +
 
     '[ OUTPUT INSTRUCTIONS ]\n' +
     '1. Report ONLY rulings you actually found in the web search results. NEVER fabricate rulings, ruling numbers, dates, HS codes or URLs.\n' +
@@ -1516,7 +1650,7 @@ function _buildRequest(region, apiKey, dateRangeStr, year) {
     '3. "url_source": the name of the website/publication the url belongs to (e.g., "CBP CROSS", "Lexology", "관세청 보도자료"). Empty if url is empty.\n' +
     '4. "importance": rate each ruling — "상" if a monitored company (Samsung, LG Electronics, Apple, etc.) is directly involved as applicant/party, ' +
        'or the classification of a core monitored product was changed or disputed; "중" if it concerns a monitored product category; ' +
-       '"하" if relevant only by HS chapter. Use exactly one of: 상 / 중 / 하.\n' +
+       '"하" if relevant only by HS chapter OR if it matches none of the priority criteria. Use exactly one of: 상 / 중 / 하.\n' +
     '5. Be EXHAUSTIVE: report EVERY distinct ruling you find in the search results — do NOT summarize down to a few highlights. ' +
        'Return up to 25 rulings, most recent first.\n' +
     '6. Output STRICTLY VALID JSON between the markers: double-quoted keys and strings, no trailing commas, no comments, ' +
