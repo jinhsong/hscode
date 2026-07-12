@@ -2,6 +2,19 @@
  * HS Code 유권해석(Ruling) 주간 모니터링 시스템
  * ─────────────────────────────────────────────
  * [변경 이력]
+ * v4.7 (링크 정확도 + 같은 사건 중복 병합)
+ *  - [링크 정확도] "Page not found" 방지: 접속 검증을 실제로 통과(OK/OK(API))했거나 항상 유효한
+ *      리다이렉터(news.google.com)인 URL만 원문 링크로 노출(_isLinkTrusted). 미검증/SKIP URL은
+ *      링크 대신 공식 DB 검색·구글 검색 버튼으로 대체(항목 자체는 유지).
+ *  - [중복 병합] 같은 사건을 다룬 여러 매체 보도·RSS/Gemini/공식 소스 간 중복을 하나로(_dedupSimilar):
+ *      ① 정규화 URL 동일 ② 같은 국가 내 제목 유사도(Jaccard ≥ 0.55, CJK는 문자 바이그램).
+ *      서로 다른 룰링번호는 병합 금지(정형화 제목의 별개 룰링 보호).
+ *      대표는 공식 > 뉴스RSS > AI검색 순으로 남기고 부족한 필드(hs_code 등)는 병합.
+ *  - Google News 제목의 "제목 - 매체명"에서 매체명 분리(출처 표기·유사도 정확도↑),
+ *      base64 링크에서 원 기사 URL best-effort 디코드(_decodeGnewsUrl — 중복판정용)
+ *  - 구글뉴스 링크는 접속 검증 생략(항상 유효) — 검증 예산을 실제 의심 URL에 집중
+ *  - 파이프라인 통계에 '같은 사건 병합' 건수 추가
+ *
  * v4.6 (직수집기 추가 — 뉴스 RSS 14피드 + GOV.UK API)
  *  - [핵심] Google News RSS 직수집(_collectRssNews): 국가·현지어별 14개 피드
  *      (한국어/일본어/중국어/베트남어/포르투갈어/스페인어/터키어/러시아어/독일어/아랍어/영어 + 인도 Taxscan·TaxGuru RSS).
@@ -780,11 +793,22 @@ var COUNTRY_SEARCH_LANG = {
  *  ④ 일반 구글 검색 (현지 언어 hl/gl) → "구글 검색"
  * 항상 ①or② 버튼 + ③ + ④ 순으로 최대 3개 버튼을 표시한다.
  */
+/**
+ * 링크로 내보내도 되는 URL인지 판정 — "Page not found" 방지.
+ * 접속 검증을 실제로 통과('OK'/'OK(API)')했거나, 안정적인 리다이렉터(news.google.com)인 경우만 신뢰.
+ * 미검증('미검증'/'SKIP'/'')은 링크로 노출하지 않는다 — 모델이 지어낸 URL이 섞여 있을 수 있기 때문.
+ */
+function _isLinkTrusted(item) {
+  if (!item.url || !/^https?:\/\//i.test(item.url)) return false;
+  var st = String(item.url_status || '');
+  if (st.indexOf('OK') === 0) return true;                       // 'OK', 'OK(API)'
+  if (/^https?:\/\/news\.google\.com\//i.test(item.url)) return true; // 구글뉴스 리다이렉트는 항상 유효
+  return false;
+}
+
 /** 수집 URL(검증 통과) 또는 공식 DB 직링크 중 가장 신뢰할 수 있는 원문 URL 반환 (없으면 '') */
 function _directOriginalUrl(item) {
-  var urlOk = item.url && /^https?:\/\//i.test(item.url) &&
-              String(item.url_status || '').indexOf('FAIL') === -1;
-  if (urlOk) return item.url;
+  if (_isLinkTrusted(item)) return item.url;
   var official = OFFICIAL_DB[item.country] || null;
   if (official && official.rulingUrl && item.ruling_number) {
     return official.rulingUrl.replace('{NUM}', encodeURIComponent(String(item.ruling_number).trim()));
@@ -803,10 +827,8 @@ function _buildSourceLink(item) {
            label + '</a>';
   }
 
-  // ① 수집된 원문 URL (검증 실패 'FAIL'은 제외, 미검증은 표시)
-  var urlOk = item.url && /^https?:\/\//i.test(item.url) &&
-              String(item.url_status || '').indexOf('FAIL') === -1;
-  if (urlOk) {
+  // ① 수집된 원문 URL — 접속 검증을 통과한 링크만 노출 ("Page not found" 방지)
+  if (_isLinkTrusted(item)) {
     var srcName = item.url_source ? ' (' + _escapeHtml(item.url_source) + ')' : '';
     buttons.push(btn(_escapeHtml(item.url), '원문 보기' + srcName, '#c62828'));
   }
@@ -977,14 +999,18 @@ function runHSRulingMonitor() {
   // 2차: URL 실제 접속 검증 (시간예산 내에서 라운드 배치 처리 — 예산 소진 시 조기 중단, 이후 단계는 항상 실행)
   _verifyItemUrls(scoped);
 
-  // 3차: 미검증 AI검색 항목 처리 (RECALL_MODE면 태깅만, 아니면 제외)
-  var refined = _applyUnverifiedDrop(scoped);
+  // 3차: 같은 사건 중복 병합 — 여러 매체가 보도한 동일 사건, RSS·Gemini·공식 소스 간 중복을 하나로
+  var uniq = _dedupSimilar(scoped);
+
+  // 4차: 미검증 AI검색 항목 처리 (RECALL_MODE면 태깅만, 아니면 제외)
+  var refined = _applyUnverifiedDrop(uniq);
 
   // 수집 파이프라인 통계 — 메일 헤더에 표기해 "어디서 몇 건이 걸러졌는지" 가시화
   var stats = {
     collected : allResults.length,
     deduped   : deduped.length,
     scoped    : scoped.length,
+    similar   : scoped.length - uniq.length,
     final     : refined.length,
     unverified: refined.filter(function(r) { return r.unverified; }).length
   };
@@ -1379,6 +1405,12 @@ function _collectRssNews(periodStart) {
                     .replace(/\s+/g, ' ').trim();
       if (!title || !link) continue;
 
+      // Google News 제목은 "제목 - 매체명" 형식 — 매체명을 분리해 출처로 쓰고, 제목은 정제
+      // (같은 사건을 다룬 다른 매체 기사의 유사도 판정 정확도가 올라간다)
+      var publisher = '';
+      var tm = title.match(/^(.+)\s-\s([^\-]{2,60})$/);
+      if (tm && tm[1].length >= 8) { title = tm[1].trim(); publisher = tm[2].trim(); }
+
       var d = pub ? new Date(pub) : null;
       if (d && !isNaN(d.getTime()) && d < periodStart) continue;       // 기간 밖
       if (src.filter && !src.filter.test(title)) continue;              // 범용 피드는 제목 필터
@@ -1400,9 +1432,11 @@ function _collectRssNews(periodStart) {
         summary        : desc.substring(0, 200),
         issue_date     : (d && !isNaN(d.getTime())) ? _fmtDate(d) : '',
         url            : link,
-        url_source     : src.name,
+        url_source     : publisher || src.name,
         url_status     : '',
-        provenance     : '뉴스RSS'
+        provenance     : '뉴스RSS',
+        // base64 인코딩된 구글뉴스 링크에서 원 기사 URL을 best-effort 추출 — 같은 기사 중복 판정에 사용
+        canonical_url  : _decodeGnewsUrl(link)
       };
       item.importance = _autoImportance(item);
       out.push(item);
@@ -1526,6 +1560,124 @@ function _applyUnverifiedDrop(items) {
   return out;
 }
 
+// ─── 유사 중복(같은 사건·다른 매체) 병합 ─────────────────────────────────────
+
+/** Google News 기사 링크(base64 인코딩)에서 원 기사 URL을 best-effort 추출 (실패 시 '') */
+function _decodeGnewsUrl(link) {
+  try {
+    var m = String(link).match(/\/articles\/([A-Za-z0-9_\-]+)/);
+    if (!m) return '';
+    var b64 = m[1].replace(/-/g, '+').replace(/_/g, '/');
+    while (b64.length % 4) b64 += '=';
+    var bytes = Utilities.base64Decode(b64);
+    var s = '';
+    for (var i = 0; i < bytes.length; i++) {
+      var c = bytes[i] & 255;
+      s += (c >= 32 && c < 127) ? String.fromCharCode(c) : '\n';
+    }
+    var um = s.match(/https?:\/\/[^\s"'\\]{12,500}/);
+    return um ? um[0] : '';
+  } catch (e) { return ''; }
+}
+
+/** URL 정규화(프로토콜·www·utm·해시 제거) — 같은 기사의 표기 차이 병합용 */
+function _normUrl(u) {
+  var s = String(u || '').toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '');
+  s = s.split('#')[0];
+  s = s.replace(/([?&])(utm_[^=&]+|fbclid|gclid)=[^&]*/g, '$1').replace(/[?&]+$/, '');
+  return s.replace(/\/+$/, '');
+}
+
+/** 제목 → 비교용 토큰 집합. 공백 분리가 안 되는 CJK·짧은 제목은 문자 바이그램 사용 */
+function _titleShingles(item) {
+  var t = String(item.title_en || item.title || '').toLowerCase()
+    .replace(/[^0-9a-zÀ-ɏ가-힣぀-ヿ一-鿿]+/g, ' ')
+    .replace(/\s+/g, ' ').trim();
+  if (!t) return null;
+  var words = t.split(' ');
+  var set = {};
+  if (words.length >= 5) {
+    words.forEach(function(w) { if (w.length > 1) set[w] = true; });
+  } else {
+    var chars = t.replace(/ /g, '');
+    if (chars.length < 6) return null;   // 너무 짧은 제목은 유사도 판정 제외(오병합 방지)
+    for (var i = 0; i < chars.length - 1; i++) set[chars.substr(i, 2)] = true;
+  }
+  return set;
+}
+
+function _jaccard(a, b) {
+  var inter = 0, uni = 0, k;
+  for (k in a) { uni++; if (b[k]) inter++; }
+  for (k in b) { if (!a[k]) uni++; }
+  return uni ? inter / uni : 0;
+}
+
+/** 대표 항목 점수: 공식 > 뉴스RSS > AI검색 → 중요도 → 검증된 링크 보유 → 요약 길이 */
+function _repScore(it) {
+  var prov = it.provenance === '공식' ? 3 : it.provenance === '뉴스RSS' ? 2 : 1;
+  var imp  = it.importance === '상' ? 3 : it.importance === '중' ? 2 : 1;
+  return prov * 1000 + imp * 100 + (_isLinkTrusted(it) ? 10 : 0) +
+         Math.min(9, Math.floor(String(it.summary || '').length / 40));
+}
+
+/**
+ * 같은 사건을 다룬 항목들(여러 매체 보도, RSS·Gemini·공식 소스 간 중복)을 하나로 병합.
+ *  ① 정규화 URL(디코드된 원 기사 URL 포함)이 같으면 → 같은 항목
+ *  ② 같은 국가 안에서 제목 유사도(Jaccard ≥ 0.55)면 → 같은 사건.
+ *     단, 서로 다른 룰링번호를 가진 항목은 병합하지 않음(정형화된 제목의 별개 룰링 보호).
+ * 대표는 공식 > 뉴스RSS > AI검색 순으로 남기고, 대표에 없는 필드(hs_code 등)는 병합해 채운다.
+ */
+function _dedupSimilar(items) {
+  var n = items.length;
+  if (n < 2) return items.slice();
+
+  var parent = [];
+  for (var p = 0; p < n; p++) parent[p] = p;
+  function find(x) { while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; }
+  function union(a, b) { parent[find(a)] = find(b); }
+
+  // ① 정규화 URL 동일 → 병합 (구글뉴스 리다이렉트 도메인은 키로 쓰지 않음)
+  var byUrl = {};
+  items.forEach(function(it, i) {
+    [_normUrl(it.canonical_url || ''), _normUrl(it.url || '')].forEach(function(k) {
+      if (!k || k.indexOf('news.google.com') === 0) return;
+      if (byUrl[k] !== undefined) union(i, byUrl[k]); else byUrl[k] = i;
+    });
+  });
+
+  // ② 같은 국가 내 제목 유사 → 병합
+  var shs = items.map(_titleShingles);
+  for (var i = 0; i < n; i++) {
+    if (!shs[i]) continue;
+    for (var j = i + 1; j < n; j++) {
+      if (!shs[j] || items[i].country !== items[j].country) continue;
+      var ni = String(items[i].ruling_number || ''), nj = String(items[j].ruling_number || '');
+      if (ni && nj && ni !== nj) continue;   // 번호가 다르면 별개 룰링
+      if (find(i) === find(j)) continue;
+      if (_jaccard(shs[i], shs[j]) >= 0.55) union(i, j);
+    }
+  }
+
+  // 클러스터별 대표 선정 + 부족 필드 병합
+  var repOf = {};
+  items.forEach(function(it, i) {
+    var r = find(i);
+    if (repOf[r] === undefined || _repScore(it) > _repScore(items[repOf[r]])) repOf[r] = i;
+  });
+  var merged = 0, out = [];
+  items.forEach(function(it, i) {
+    var rep = items[repOf[find(i)]];
+    if (rep === it) { out.push(it); return; }
+    merged++;
+    ['hs_code', 'company', 'ruling_number', 'product_name', 'product_name_en'].forEach(function(f) {
+      if (!rep[f] && it[f]) rep[f] = it[f];
+    });
+  });
+  if (merged) Logger.log('[dedupSimilar] 같은 사건 중복 ' + merged + '건 병합 → ' + out.length + '건');
+  return out;
+}
+
 // ─── 중복 제거 ───────────────────────────────────────────────────────────────
 
 /**
@@ -1612,6 +1764,8 @@ function _verifyItemUrls(items) {
     if (String(it.url_status || '').indexOf(URL_STATUS_OFFICIAL) !== -1) return;  // 공식 API URL은 검증 불필요
     if (!it.url) { it.url_status = it.url_status || ''; return; }
     if (!/^https?:\/\//i.test(it.url)) { it.url = ''; it.url_status = 'FAIL(형식)'; return; }
+    // 구글뉴스 리다이렉트 링크는 항상 유효 — 검증 예산을 아끼고 OK 처리 (원 기사 URL은 canonical_url로 중복판정)
+    if (/^https?:\/\/news\.google\.com\//i.test(it.url)) { it.url_status = 'OK'; return; }
     if (targets.length < URL_VERIFY_MAX) targets.push(it);
     else it.url_status = 'SKIP';
   });
@@ -2308,7 +2462,9 @@ function _buildEmailHtml(results, dateRangeStr, dupCount, stats) {
     (stats
       ? '<div style="font-size:11px;color:#5d7a68;line-height:1.7;margin-top:3px;">' +
           '수집 파이프라인&nbsp;:&nbsp;수집 ' + stats.collected + '건 → 중복 제외 후 ' + stats.deduped +
-          '건 → 스코프 통과 ' + stats.scoped + '건 → 최종 <b>' + stats.final + '</b>건' +
+          '건 → 스코프 통과 ' + stats.scoped + '건' +
+          (stats.similar > 0 ? ' → 같은 사건 ' + stats.similar + '건 병합' : '') +
+          ' → 최종 <b>' + stats.final + '</b>건' +
           (stats.unverified > 0 ? ' (이 중 원문 미확인 ' + stats.unverified + '건 포함)' : '') +
         '</div>'
       : '') +
