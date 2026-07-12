@@ -2,6 +2,17 @@
  * HS Code 유권해석(Ruling) 주간 모니터링 시스템
  * ─────────────────────────────────────────────
  * [변경 이력]
+ * v5.1 (실행 로그 분석 반영 — CBP 장애가 예산을 독식하던 문제 해결)
+ *  - [원인] 실측: CBP 요청 56건이 각 ~25초 지연 후 HTTP 500 → 혼자 217초(예산 80%) 소모 →
+ *      RSS 절반·Gemini 5개 패스·URL검증·번역이 전부 예산 부족으로 생략됨 (발송은 4건뿐)
+ *  - [CBP] 프로브 방식 도입: 4개 파라미터 변형(minimal/collection/sortBy × page 0·1)을 1건짜리
+ *      병렬 프로브로 먼저 확인 → 유효 조합으로만 본 수집, 성공 조합은 캐시(CBP_VARIANT).
+ *      전부 실패하면 즉시 생략 — 느린 실패 56회 대신 1회분 시간만 소모.
+ *      (기존 '전량 실패 재시도'는 200이 하나라도 있으면 발동 안 하는 구멍이 있었음)
+ *  - [순서] 수집 순서 재배열: 빠르고 값싼 소스부터 (RSS → GOV.UK → FedReg → EUR-Lex → CBP → Gemini)
+ *      + 단계별 소요시간 로그 — 특정 소스 장애가 뒤 소스를 굶기는 것 방지
+ *  - [예산] EXEC_BUDGET_MS 270 → 330초, CBP_PAGES 2 → 1 (주간 창에 50건/검색어면 충분, 요청 56→28)
+ *
  * v5.0 (주간 운영 최적화 — 시간·비용 효율화 + 미국/유럽 직수집 중심 재편)
  *  - [주기] 조회기간 30 → 7일: 매주 월요일 발행 · 최근 일주일치 (dedup이 있어 경계 누락 없음)
  *  - [시간] 실행 순서 반전: 무료·고속 직수집(CBP/FedReg/EUR-Lex/GOV.UK/RSS)을 먼저 확보하고
@@ -220,7 +231,7 @@ var URL_VERIFY_MAX_HOPS = 5;      // 리다이렉트 추적 최대 홉 수 (라�
 // runHSRulingMonitor() 시작 시각을 기록해두고, 검증/재시도처럼 시간이 걸리는 단계에서
 // 남은 예산을 확인해 조기 종료 → 저장(_saveToSheet)·발송(_sendEmail)은 항상 실행되도록 보장.
 var EXEC_START_MS          = null;
-var EXEC_BUDGET_MS         = 270000; // 4.5분 — 이후로는 검증/재시도를 중단하고 저장·발송으로 넘어감
+var EXEC_BUDGET_MS         = 330000; // 5.5분 — 이후로는 검증/재시도를 중단하고 저장·발송으로 넘어감 (한도 6분)
 var RETRY_TIME_RESERVE_MS  = 60000;  // 재시도 단계: 남은 예산 60초 미만이면 생략
 var VERIFY_TIME_RESERVE_MS = 20000;  // URL 검증: 남은 예산 20초 미만이면 중단
 
@@ -241,7 +252,7 @@ var USE_RSS_NEWS         = true;   // Google News RSS + 전문지 RSS 직수집 
 var RSS_MAX_PER_FEED     = 20;     // RSS 피드당 채택 상한 (소스별 max로 개별 조정 가능)
 var RSS_MAX_PER_COUNTRY  = 12;     // RSS 국가당 총 채택 상한 — 특정 국가(피드 다수) 편중 방지
 var CBP_PAGE_SIZE        = 50;     // CBP 검색어당 페이지 크기 (최신순)
-var CBP_PAGES            = 2;      // 검색어당 조회 페이지 수 (page 0부터) — 2면 최대 100건/검색어
+var CBP_PAGES            = 1;      // 검색어당 조회 페이지 수 — 주간(7일) 창에는 50건/검색어로 충분
 var CBP_MAX_PER_TERM     = 100;    // 검색어당 기간 내 채택 상한
 var CBP_MAX_TOTAL        = 80;     // 주간 총 채택 상한 — 미국 편중으로 리포트가 넘치는 것 방지
 var EURLEX_MAX           = 80;     // EU 분류규칙 최대 수집 건수
@@ -780,45 +791,24 @@ function runHSRulingMonitor() {
 
   var allResults = [];
 
-  // ── 실행 순서: 무료·고속 직수집(공식 API·RSS)을 먼저 확보하고, 시간이 많이 드는
-  //    Gemini 그라운딩은 남은 예산으로 수행 — 시간 초과 시에도 직수집분은 반드시 발송된다. ──
+  // ── 실행 순서: 빠르고 값싼 소스부터 (RSS → GOV.UK → FedReg → EUR-Lex → CBP → Gemini).
+  //    실측상 특정 API(예: CBP 장애 시 요청당 ~25초 지연 후 500)가 예산을 독식하면 뒤 소스가
+  //    전부 굶으므로, 위험한 소스를 뒤로 보내고 단계별 소요시간을 로그로 남긴다. ──
+  function _runCollector(label, enabled, fn) {
+    if (!enabled) return;
+    var t0 = _elapsedMs();
+    try {
+      var items = fn();
+      allResults.push.apply(allResults, items);
+      Logger.log('[' + label + '] ' + items.length + '건 수집 (' + Math.round((_elapsedMs() - t0) / 1000) + '초)');
+    } catch (e) { Logger.log('[' + label + '] 오류: ' + e.message); }
+  }
 
-  // ── 공식 API 직접 수집 (하이브리드) — 영구 원문 URL + 대량 수집 ──
-  if (USE_CBP_API) {
-    try {
-      var cbp = _collectCbpRulings(periodStart);
-      allResults.push.apply(allResults, cbp);
-      Logger.log('[CBP CROSS API] ' + cbp.length + '건 수집');
-    } catch (e) { Logger.log('[CBP CROSS API] 오류: ' + e.message); }
-  }
-  if (USE_FEDERAL_REGISTER) {
-    try {
-      var fr = _collectFederalRegister(periodStart);
-      allResults.push.apply(allResults, fr);
-      Logger.log('[Federal Register API] ' + fr.length + '건 수집');
-    } catch (e) { Logger.log('[Federal Register API] 오류: ' + e.message); }
-  }
-  if (USE_EU_EURLEX) {
-    try {
-      var eu = _collectEuClassificationRegs(periodStart);
-      allResults.push.apply(allResults, eu);
-      Logger.log('[EU EUR-Lex API] ' + eu.length + '건 수집');
-    } catch (e) { Logger.log('[EU EUR-Lex API] 오류: ' + e.message); }
-  }
-  if (USE_UK_GOVUK) {
-    try {
-      var uk = _collectGovUkDecisions(periodStart);
-      allResults.push.apply(allResults, uk);
-      Logger.log('[GOV.UK API] ' + uk.length + '건 수집');
-    } catch (e) { Logger.log('[GOV.UK API] 오류: ' + e.message); }
-  }
-  if (USE_RSS_NEWS) {
-    try {
-      var rss = _collectRssNews(periodStart);
-      allResults.push.apply(allResults, rss);
-      Logger.log('[뉴스 RSS] ' + rss.length + '건 수집 (' + RSS_SOURCES.length + '개 피드)');
-    } catch (e) { Logger.log('[뉴스 RSS] 오류: ' + e.message); }
-  }
+  _runCollector('뉴스 RSS', USE_RSS_NEWS, function() { return _collectRssNews(periodStart); });
+  _runCollector('GOV.UK API', USE_UK_GOVUK, function() { return _collectGovUkDecisions(periodStart); });
+  _runCollector('Federal Register API', USE_FEDERAL_REGISTER, function() { return _collectFederalRegister(periodStart); });
+  _runCollector('EU EUR-Lex API', USE_EU_EURLEX, function() { return _collectEuClassificationRegs(periodStart); });
+  _runCollector('CBP CROSS API', USE_CBP_API, function() { return _collectCbpRulings(periodStart); });
 
   // ── Gemini 그라운딩 보완 수집 — 직수집 확보 후 남은 시간예산으로 실행 ──
   Logger.log('[HSRulingMonitor] 직수집 완료(' + allResults.length + '건, ' +
@@ -976,44 +966,78 @@ function _fetchAllInBatches(requests) {
  * 원문 URL은 rulings.cbp.gov/ruling/{번호} 형태의 영구 canonical URL.
  * ※ CBP API 응답 필드명은 변동 가능 → 여러 후보 필드명을 폴백 처리. testCbpApi()로 실제 구조 확인 가능.
  */
+// CROSS API 파라미터 변형 사다리 — 실측상 조합에 따라 500(page=0 계열) 또는 '200 + 빈 배열'
+// (sortBy/collection이 검색은 되되 결과 반환을 깨는 케이스)이 나온다. 어느 조합이 유효한지
+// 실행 시점에 1건짜리 프로브로 확인한 뒤 본 수집을 진행하고, 성공 조합은 캐시한다.
+var CBP_PARAM_VARIANTS = [
+  { label: 'minimal/p1', qs: '',                                  firstPage: 1 },
+  { label: 'coll/p1',    qs: '&collection=ALL',                   firstPage: 1 },
+  { label: 'sort/p1',    qs: '&collection=ALL&sortBy=DATE_DESC',  firstPage: 1 },
+  { label: 'minimal/p0', qs: '',                                  firstPage: 0 }
+];
+
+function _cbpUrl(term, page, variant, pageSize) {
+  return 'https://rulings.cbp.gov/api/search?term=' + encodeURIComponent(term) +
+         '&pageSize=' + (pageSize || CBP_PAGE_SIZE) + '&page=' + page + variant.qs;
+}
+
+function _cbpParseRulings(resp) {
+  if (!resp || resp.getResponseCode() !== 200) return null;
+  try {
+    var data = JSON.parse(resp.getContentText());
+    var arr = data.rulings || data.results || data.Rulings || (data.data && data.data.rulings) || [];
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) { return null; }
+}
+
+/**
+ * 4개 파라미터 변형을 병렬로 1건씩 프로브해 '200 + 결과 있음'인 첫 조합을 반환.
+ * 성공 조합은 스크립트 속성(CBP_VARIANT)에 캐시해 다음 실행에서 우선 시도.
+ * 전부 실패하면 null — 본 수집을 생략해 느린 실패(요청당 ~25초)가 예산을 태우는 것을 방지.
+ */
+function _cbpProbeVariant() {
+  var props  = PropertiesService.getScriptProperties();
+  var cached = props.getProperty('CBP_VARIANT');
+  var order  = CBP_PARAM_VARIANTS.slice();
+  if (cached) order.sort(function(a, b) { return (a.label === cached ? -1 : 0) - (b.label === cached ? -1 : 0); });
+
+  var probes = order.map(function(v) {
+    return { url: _cbpUrl('tariff classification', v.firstPage, v, 5),
+             method: 'get', muteHttpExceptions: true, headers: { 'Accept': 'application/json' } };
+  });
+  var resps;
+  try { resps = UrlFetchApp.fetchAll(probes); }
+  catch (e) { Logger.log('[CBP] 프로브 실패: ' + e.message); return null; }
+
+  for (var i = 0; i < order.length; i++) {
+    var arr = _cbpParseRulings(resps[i]);
+    if (arr && arr.length > 0) {
+      if (order[i].label !== cached) props.setProperty('CBP_VARIANT', order[i].label);
+      Logger.log('[CBP] 프로브 성공: ' + order[i].label);
+      return order[i];
+    }
+  }
+  var f = (resps || []).filter(function(r) { return r; })[0];
+  Logger.log('[CBP] 모든 파라미터 조합 프로브 실패 — 이번 실행은 CROSS 수집 생략' +
+             (f ? ' (첫 응답 HTTP ' + f.getResponseCode() + ': ' + f.getContentText().substring(0, 150) + ')' : ''));
+  return null;
+}
+
 function _collectCbpRulings(periodStart) {
-  // 검색어 × 페이지 조합으로 요청 생성.
-  // ※ CROSS API의 page는 0부터 시작 (실측: totalHits>0인데 page=1이 빈 배열 → 0-인덱스 확인)
-  //    CBP_PAGES=2면 page 0,1 요청 = 검색어당 최대 100건.
+  var variant = _cbpProbeVariant();
+  if (!variant) return [];
+
   var reqMeta = [];
   CBP_SEARCH_TERMS.forEach(function(term) {
-    for (var p = 0; p < CBP_PAGES; p++) reqMeta.push({ term: term, page: p });
+    for (var p = 0; p < CBP_PAGES; p++) reqMeta.push({ term: term, page: variant.firstPage + p });
   });
   var reqs = reqMeta.map(function(m) {
-    return {
-      url: 'https://rulings.cbp.gov/api/search?term=' + encodeURIComponent(m.term) +
-           '&collection=ALL&sortBy=DATE_DESC&pageSize=' + CBP_PAGE_SIZE + '&page=' + m.page,
-      method: 'get', muteHttpExceptions: true,
-      headers: { 'Accept': 'application/json' }
-    };
+    return { url: _cbpUrl(m.term, m.page, variant),
+             method: 'get', muteHttpExceptions: true, headers: { 'Accept': 'application/json' } };
   });
 
-  // 배치 분할 + 429/5xx 재시도 재사용 (원래 단일 fetchAll은 재시도 없이 조용히 전체 실패했음)
+  // 배치 분할 + 429/5xx 재시도 재사용
   var resps = _fetchAllInBatches(reqs);
-
-  // 전량 실패(0/전체 200) 시 — sortBy/collection 파라미터가 API와 안 맞을 가능성 →
-  // 최소 파라미터(term/pageSize/page)로 1회 재시도하고, 첫 실패 응답을 진단 로그로 남긴다.
-  var okCount = resps.filter(function(r) { return r && r.getResponseCode() === 200; }).length;
-  if (okCount === 0 && resps.length) {
-    var f = resps.filter(function(r) { return r; })[0];
-    if (f) Logger.log('[CBP] 전량 실패 — 첫 응답 HTTP ' + f.getResponseCode() + ': ' +
-                      f.getContentText().substring(0, 200));
-    Logger.log('[CBP] 최소 파라미터로 재시도');
-    reqs = reqMeta.map(function(m) {
-      return {
-        url: 'https://rulings.cbp.gov/api/search?term=' + encodeURIComponent(m.term) +
-             '&pageSize=' + CBP_PAGE_SIZE + '&page=' + m.page,
-        method: 'get', muteHttpExceptions: true,
-        headers: { 'Accept': 'application/json' }
-      };
-    });
-    resps = _fetchAllInBatches(reqs);
-  }
 
   var bySeen = {};   // ruling number 기준 중복 제거 (검색어/페이지 간)
   var out    = [];
