@@ -2,6 +2,18 @@
  * HS Code 유권해석(Ruling) 주간 모니터링 시스템
  * ─────────────────────────────────────────────
  * [변경 이력]
+ * v5.0 (주간 운영 최적화 — 시간·비용 효율화 + 미국/유럽 직수집 중심 재편)
+ *  - [주기] 조회기간 30 → 7일: 매주 월요일 발행 · 최근 일주일치 (dedup이 있어 경계 누락 없음)
+ *  - [시간] 실행 순서 반전: 무료·고속 직수집(CBP/FedReg/EUR-Lex/GOV.UK/RSS)을 먼저 확보하고
+ *      Gemini는 남은 시간예산으로 — 시간 초과 시에도 직수집분은 반드시 발송됨.
+ *      _fetchAllInBatches에 배치 단위 시간예산 가드 추가 (예산 소진 시 나머지 배치 생략)
+ *  - [비용] Gemini 패스 27 → 12 통합 (주당 그라운딩 호출 -56%): 직수집·RSS가 바닥을 깔아주므로
+ *      Gemini는 보완역으로 축소 — 한국/일본/중국/인도 단독 유지, 북미 판결·중남미 7국·EU+영국·
+ *      중동 11국·동남아+오세아니아 8국·아프리카·CIS·글로벌은 통합 그룹 패스(국가별 검색 전략은 유지).
+ *      maxOutputTokens 16384 → 8192 (25건 JSON에 충분 — 출력 토큰 비용 절감)
+ *  - [균형] 미국 CROSS 총량 캡(CBP_MAX_TOTAL=80/주) — 직수집 정상화 후 미국 편중 방지.
+ *      번역 상한 80 → 50 (실행시간 절약)
+ *
  * v4.9 (실측 로그 기반 직수집기 수정 — CBP 페이지 인덱스 / EUR-Lex 성능)
  *  - [CBP] 실측 진단({"rulings":[],"totalHits":28})으로 page 파라미터가 0-인덱스임을 확인 —
  *      page=1,2 → page=0,1로 수정. 그동안 모든 검색어가 빈 페이지를 받아 0건이었음.
@@ -183,7 +195,7 @@ var MODEL_NAME      = 'gemini-2.5-flash';
 var DB_SHEET_NAME   = '동향DB';
 var RCPT_SHEET_NAME = '발송인 명단';
 
-var MONITORING_DAYS = 30;   // 조회기간 — dedup이 있으므로 넓혀도 중복 없이 회수율만 상승
+var MONITORING_DAYS = 7;    // 조회기간 — 매주 월요일 발행 · 최근 일주일치 (dedup이 있어 경계 누락 없음)
 
 // ─── 수집량 우선 모드 ────────────────────────────────────────────────────────
 // true  : 최대 수집 — 스코프 재검사·URL 미검증을 이유로 버리지 않고 '미검증' 배지로 구분만 한다.
@@ -193,7 +205,7 @@ var RECALL_MODE = true;
 
 // 발송 전 한국어 번역 (RSS·해외 소스 항목의 제목/요약) — Apps Script 내장 LanguageApp 사용
 var TRANSLATE_TO_KO = true;
-var TRANSLATE_MAX   = 80;   // 실행당 번역 호출 상한 (LanguageApp 일일 쿼터 보호)
+var TRANSLATE_MAX   = 50;   // 실행당 번역 호출 상한 (호출당 ~0.5초 — 실행시간·쿼터 보호)
 
 // API 호출 배치 크기/대기 — 무료 등급은 분당 요청 제한이 낮으므로 배치로 나눠 호출
 var API_BATCH_SIZE     = 7;
@@ -229,8 +241,9 @@ var USE_RSS_NEWS         = true;   // Google News RSS + 전문지 RSS 직수집 
 var RSS_MAX_PER_FEED     = 20;     // RSS 피드당 채택 상한 (소스별 max로 개별 조정 가능)
 var RSS_MAX_PER_COUNTRY  = 12;     // RSS 국가당 총 채택 상한 — 특정 국가(피드 다수) 편중 방지
 var CBP_PAGE_SIZE        = 50;     // CBP 검색어당 페이지 크기 (최신순)
-var CBP_PAGES            = 2;      // 검색어당 조회 페이지 수 — 2면 최대 100건/검색어
+var CBP_PAGES            = 2;      // 검색어당 조회 페이지 수 (page 0부터) — 2면 최대 100건/검색어
 var CBP_MAX_PER_TERM     = 100;    // 검색어당 기간 내 채택 상한
+var CBP_MAX_TOTAL        = 80;     // 주간 총 채택 상한 — 미국 편중으로 리포트가 넘치는 것 방지
 var EURLEX_MAX           = 80;     // EU 분류규칙 최대 수집 건수
 
 // ─── 정확성/출처 정책 (1단계) ───────────────────────────────────────────────
@@ -360,308 +373,140 @@ var SHEET_HIGHLIGHT_BG = '#fff5f5';  // 중요도 '상' 행 하이라이트
 // prompt 내 {DAYS} → MONITORING_DAYS, {YEAR} → 실행 연도로 자동 치환됨
 var MONITORING_REGIONS = [
 
-  // ── 동북아 ── (한국은 공식 DB / 뉴스·업계 2개 패스로 분할해 회수율 확대)
+  // ── 동북아 ──
   {
     category: '동북아', region: '한국', countryName: '한국',
-    source  : '관세청 (품목분류 고시·보도자료)',
-    prompt  : 'Goal: find ALL official Korean customs HS classification decisions published in the last {DAYS} days. ' +
+    source  : '관세청 고시·보도자료 / 전문지',
+    prompt  : 'Goal: find ALL Korean HS classification decisions and reported cases in the last {DAYS} days. ' +
               'Search strategy (run each, IN KOREAN): ' +
               '1) site:customs.go.kr 품목분류  ' +
-              '2) "관세품목분류위원회" 결정 {YEAR}  ' +
-              '3) "품목분류 사전심사" 결정  ' +
-              '4) 관세평가분류원 품목분류  ' +
-              '5) 품목분류 변경 고시 행정예고. ' +
+              '2) "관세품목분류위원회" OR "품목분류 사전심사" 결정 {YEAR}  ' +
+              '3) 품목분류 변경 고시 행정예고  ' +
+              '4) 품목분류 쟁송 OR 심판 OR 소송 (한국관세신문·관세무역신문 등 전문지)  ' +
+              '5) 조세심판원 OR 법원 품목분류 결정. ' +
               'Note: the CLIP database (unipass.customs.go.kr) is behind a search form and NOT indexed by Google — ' +
-              'do not expect direct ruling pages; press releases, 고시/행정예고 notices and attached PDFs are the findable sources.'
-  },
-  {
-    category: '동북아', region: '한국(뉴스)', countryName: '한국',
-    source  : '한국 관세 전문지·업계 보도',
-    prompt  : 'Goal: find Korean HS classification ruling CASES reported by news/trade press in the last {DAYS} days. ' +
-              'Search strategy (run each, IN KOREAN): ' +
-              '1) 품목분류 쟁송 OR 심판 OR 소송 {YEAR}  ' +
-              '2) 조세심판원 품목분류 결정  ' +
-              '3) 대법원 OR 고등법원 품목분류 판결  ' +
-              '4) HS코드 분류 결정 (한국관세신문, 관세무역신문 등 전문지)  ' +
-              '5) 관세법인 OR 로펌 뉴스레터 품목분류. ' +
-              'These are indexed news sources — report every distinct case found.'
+              'press releases, 고시/행정예고 notices and news are the findable sources.'
   },
   {
     category: '동북아', region: '일본',
     source  : 'Japan Customs 사전교시(事前教示)',
-    prompt  : 'Goal: find ALL Japanese customs advance classification rulings (事前教示) and classification decisions published in the last {DAYS} days. ' +
+    prompt  : 'Goal: find ALL Japanese customs advance classification rulings (事前教示) and classification decisions in the last {DAYS} days. ' +
               'Search strategy (run each, IN JAPANESE): ' +
               '1) site:customs.go.jp 事前教示 回答事例  ' +
               '2) 事前教示 品目分類 {YEAR}  ' +
-              '3) 関税分類 決定 {YEAR}  ' +
+              '3) 関税分類 決定  ' +
               '4) 税関 品目分類 変更  ' +
-              '5) English supplement: Japan customs classification ruling {YEAR}. ' +
-              'The 事前教示回答事例 pages on customs.go.jp are public HTML — site: searches can surface individual rulings.'
+              '5) English supplement: Japan customs classification ruling {YEAR}.'
   },
 
-  // ── 중국 ── (공식 归类决定 / 뉴스·업계 2개 패스로 분할)
+  // ── 중국 ──
   {
     category: '중국', region: '중국', countryName: '중국',
-    source  : '中国海关总署 归类决定',
-    prompt  : 'Goal: find ALL official Chinese customs classification decisions (归类决定 / 商品归类) published in the last {DAYS} days. ' +
+    source  : '海关总署 归类决定 / 전문지',
+    prompt  : 'Goal: find ALL Chinese customs classification decisions (归类决定/商品归类) and reported cases in the last {DAYS} days. ' +
               'Search strategy (run each, IN CHINESE): ' +
               '1) site:customs.gov.cn 归类 公告  ' +
               '2) 海关总署公告 {YEAR} 归类决定  ' +
               '3) 商品归类决定 {YEAR}  ' +
-              '4) 税则归类 裁定  ' +
-              '5) English supplement: China customs classification decision announcement {YEAR}.'
-  },
-  {
-    category: '중국', region: '중국(뉴스)', countryName: '중국',
-    source  : '중국 관세·무역 전문지',
-    prompt  : 'Goal: find Chinese HS classification ruling CASES reported by trade press, customs brokers, or law firms in the last {DAYS} days. ' +
-              'Search strategy (run each, IN CHINESE): ' +
-              '1) 商品归类 案例 {YEAR}  ' +
-              '2) 归类争议 OR 归类差错 海关  ' +
-              '3) 海关 归类 行政处罚 案例  ' +
-              '4) 关务 归类 (关务小二, 云关通 등 실무 매체)  ' +
-              '5) English supplement: China customs classification dispute {YEAR} (KPMG/PwC China trade alerts).'
+              '4) 归类争议 OR 归类差错 案例  ' +
+              '5) English supplement: China customs classification decision {YEAR}.'
   },
 
-  // ── 북미 ──
+  // ── 북미 (판결·심판 — 일상적 CROSS 결정은 CBP API로 직수집) ──
   {
-    category: '북미', region: '미국',
-    source  : 'U.S. CIT/CAFC 품목분류 판결 (CROSS는 API 직수집)',
-    // ※ 일상적 CROSS 결정은 CBP API로 전수 수집하므로, 여기서는 그 外 '분류 판결'만 보완
-    prompt  : 'Goal: find US COURT decisions on HTSUS tariff classification in the last {DAYS} days, EXCLUDING routine CBP CROSS ruling letters (collected separately via API). ' +
+    category: '북미', region: '미국/캐나다 판결', isGroup: true,
+    countries: ['미국', '캐나다'],
+    source  : 'CIT/CAFC(미국) · CITT(캐나다) 분류 판결',
+    prompt  : 'Goal: find US and Canadian tariff classification COURT/TRIBUNAL decisions in the last {DAYS} days. ' +
+              'EXCLUDE routine CBP CROSS ruling letters (collected separately via API). ' +
               'Search strategy (run each): ' +
               '1) site:cit.uscourts.gov classification slip opinion {YEAR}  ' +
-              '2) Court of International Trade "tariff classification" decision {YEAR}  ' +
-              '3) CAFC HTSUS classification opinion  ' +
-              '4) Lexology OR Mondaq US tariff classification court  ' +
-              '5) customs classification litigation news {YEAR}. ' +
-              'Each result MUST decide how a specific product is classified (HTS heading determination), not a tariff-rate or policy measure.'
-  },
-  {
-    category: '북미', region: '캐나다',
-    source  : 'CITT 분류 심판 / 캐나다 관세 보도',
-    prompt  : 'Goal: find Canadian tariff classification decisions in the last {DAYS} days — primarily CITT (Canadian International Trade Tribunal) appeal decisions. ' +
-              'Search strategy (run each): ' +
-              '1) site:citt-tcce.gc.ca tariff classification appeal {YEAR}  ' +
-              '2) CITT decision tariff classification  ' +
-              '3) Canada customs classification appeal news  ' +
-              '4) Canadian trade law firm alert tariff classification  ' +
+              '2) CAFC HTSUS classification opinion {YEAR}  ' +
+              '3) site:citt-tcce.gc.ca tariff classification appeal  ' +
+              '4) Lexology OR Mondaq US OR Canada tariff classification court  ' +
               '5) French: TCCE décision classement tarifaire. ' +
-              'Note: CBSA advance rulings are NOT published individually — tribunal decisions and professional press are the findable sources.'
+              'Each result MUST decide how a specific product is classified, not a tariff-rate/policy measure. ' +
+              'Use the actual country name (미국 / 캐나다) in the country field.'
   },
 
-  // ── 중남미 ──
+  // ── 중남미 (통합) ──
   {
-    category: '중남미', region: '멕시코',
-    source  : 'SAT / DOF (관보)',
-    prompt  : 'Goal: find ALL Mexican tariff classification decisions (criterios de clasificación arancelaria) published in the last {DAYS} days. ' +
-              'Search strategy (run each, IN SPANISH): ' +
-              '1) site:dof.gob.mx clasificación arancelaria criterio  ' +
-              '2) SAT criterios de clasificación arancelaria {YEAR}  ' +
-              '3) ANAM clasificación arancelaria resolución  ' +
-              '4) noticias clasificación arancelaria México TIGIE  ' +
-              '5) English supplement: Mexico tariff classification decision {YEAR}.'
-  },
-  {
-    category: '중남미', region: '브라질',
-    source  : 'Receita Federal — Soluções de Consulta',
-    prompt  : 'Goal: find ALL Brazilian NCM classification decisions (Soluções de Consulta sobre classificação fiscal de mercadorias) published in the last {DAYS} days. ' +
-              'Search strategy (run each, IN PORTUGUESE): ' +
+    category: '중남미', region: '중남미', isGroup: true,
+    countries: ['멕시코', '브라질', '콜롬비아', '페루', '아르헨티나', '칠레', '파나마'],
+    source  : 'RFB(브라질) / SAT(멕시코) / DIAN / SUNAT / 남미 관세당국',
+    prompt  : 'Goal: find ALL Latin American tariff classification decisions in the last {DAYS} days ' +
+              '(Mexico, Brazil, Colombia, Peru, Argentina, Chile, Panama). ' +
+              'Search strategy (run each, IN PORTUGUESE/SPANISH): ' +
               '1) site:normas.receita.fazenda.gov.br "Solução de Consulta" classificação  ' +
-              '2) "Solução de Consulta" "classificação fiscal de mercadorias" {YEAR}  ' +
-              '3) Receita Federal NCM classificação decisão  ' +
-              '4) notícias classificação NCM {YEAR}  ' +
-              '5) English supplement: Brazil NCM classification ruling {YEAR}. ' +
-              'Soluções de Consulta are published as indexed HTML on normas.receita.fazenda.gov.br — report every one about classification.'
-  },
-  {
-    category: '중남미', region: '콜롬비아',
-    source  : 'DIAN — Resoluciones de clasificación',
-    prompt  : 'Goal: find ALL Colombian tariff classification resolutions published in the last {DAYS} days. ' +
-              'Search strategy (run each, IN SPANISH): ' +
-              '1) site:dian.gov.co resolución clasificación arancelaria  ' +
-              '2) DIAN clasificación arancelaria {YEAR}  ' +
-              '3) noticias Colombia clasificación arancelaria resolución  ' +
-              '4) English supplement: Colombia tariff classification ruling {YEAR}.'
-  },
-  {
-    category: '중남미', region: '페루',
-    source  : 'SUNAT — Resoluciones de clasificación',
-    prompt  : 'Goal: find ALL Peruvian tariff classification resolutions published in the last {DAYS} days. ' +
-              'Search strategy (run each, IN SPANISH): ' +
-              '1) site:sunat.gob.pe clasificación arancelaria resolución  ' +
-              '2) SUNAT INTA resolución clasificación arancelaria {YEAR}  ' +
-              '3) noticias Perú clasificación arancelaria  ' +
-              '4) English supplement: Peru tariff classification ruling {YEAR}.'
-  },
-  {
-    category: '중남미', region: '아르헨티나/칠레/파나마', isGroup: true,
-    countries: ['아르헨티나', '칠레', '파나마'],
-    source  : 'ARCA(아르헨티나) / Aduana Chile / ANA(파나마)',
-    prompt  : 'Goal: find tariff classification decisions from Argentina, Chile, or Panama published in the last {DAYS} days. ' +
-              'Search strategy (run each, IN SPANISH): ' +
-              '1) Argentina resolución clasificación arancelaria {YEAR}  ' +
-              '2) site:aduana.cl resolución clasificación  ' +
-              '3) Chile aduana clasificación arancelaria dictamen  ' +
-              '4) Panamá ANA clasificación arancelaria resolución  ' +
-              '5) English news sweep: Argentina OR Chile OR Panama tariff classification {YEAR}. ' +
-              'Use the actual country name (아르헨티나 / 칠레 / 파나마) in the country field for each ruling found.'
+              '2) "clasificación arancelaria" resolución (SAT OR DIAN OR SUNAT) {YEAR}  ' +
+              '3) site:dof.gob.mx clasificación arancelaria criterio  ' +
+              '4) Aduana Chile OR ANA Panamá OR Argentina resolución clasificación  ' +
+              '5) notícias classificação NCM OR noticias clasificación arancelaria. ' +
+              'Use the actual country name (멕시코 / 브라질 / 콜롬비아 / 페루 / 아르헨티나 / 칠레 / 파나마) in the country field.'
   },
 
-  // ── 인도 ── (공식 CAAR·CESTAT / 세무 전문지 2개 패스 — 인도는 룰링 기사화가 활발한 고수율 지역)
+  // ── 인도 (통합 — RSS 3개 피드가 뉴스를 별도 커버) ──
   {
     category: '인도', region: '인도', countryName: '인도',
-    source  : 'India CAAR / CESTAT',
-    prompt  : 'Goal: find ALL Indian customs classification rulings in the last {DAYS} days — CAAR (Customs Authority for Advance Rulings, Mumbai/Delhi) advance rulings and CESTAT classification decisions. ' +
+    source  : 'CAAR / CESTAT / 세무 전문지',
+    prompt  : 'Goal: find ALL Indian customs classification rulings in the last {DAYS} days — CAAR advance rulings, CESTAT decisions. ' +
               'Search strategy (run each): ' +
               '1) CAAR Mumbai OR Delhi advance ruling classification {YEAR}  ' +
               '2) CESTAT customs classification decision {YEAR}  ' +
-              '3) site:cbic.gov.in classification advance ruling  ' +
-              '4) customs tariff heading dispute India {YEAR}  ' +
-              '5) CBIC circular classification {YEAR}.'
-  },
-  {
-    category: '인도', region: '인도(전문지)', countryName: '인도',
-    source  : 'TaxGuru / Taxscan / LiveLaw',
-    prompt  : 'Goal: find Indian HS/HSN classification ruling CASES reported by Indian tax/legal media in the last {DAYS} days. ' +
-              'These sites publish full texts of CAAR/CESTAT rulings and are well indexed. ' +
-              'Search strategy (run each): ' +
-              '1) site:taxguru.in CAAR classification ruling  ' +
-              '2) site:taxscan.in customs classification  ' +
-              '3) site:livelaw.in customs classification CESTAT  ' +
+              '3) site:taxguru.in OR site:taxscan.in CAAR classification  ' +
               '4) HSN classification ruling India {YEAR}  ' +
-              '5) advance ruling customs classification India news.'
+              '5) site:cbic.gov.in classification advance ruling.'
   },
 
-  // ── 유럽 ── (EU는 EUR-Lex 분류규칙을 API로도 직수집하며, Gemini는 2개 보완 패스로 분리)
+  // ── 유럽 (통합 — EUR-Lex 분류규칙은 API 직수집, 영국 심판결정은 GOV.UK API 직수집) ──
   {
-    category: '유럽', region: 'EU',
-    source  : 'EU 분류규칙(Official Journal) / CJEU 판결',
-    prompt  : 'Goal: find ALL EU classification acts in the last {DAYS} days — Commission Implementing Regulations on CN classification and CJEU classification judgments. ' +
+    category: '유럽', region: 'EU/영국', isGroup: true,
+    countries: ['EU', '영국'],
+    source  : 'CJEU · 회원국 법원 · UK FTT 분류 판결 / 로펌 얼럿',
+    prompt  : 'Goal: find EU and UK tariff classification COURT decisions and professional alerts in the last {DAYS} days. ' +
+              'EU Official Journal classification regulations and GOV.UK items are collected separately via API — focus on the rest. ' +
               'Search strategy (run each): ' +
-              '1) site:eur-lex.europa.eu "classification of certain goods in the Combined Nomenclature" {YEAR}  ' +
-              '2) Official Journal Commission Implementing Regulation classification {YEAR}  ' +
-              '3) site:curia.europa.eu Combined Nomenclature judgment  ' +
-              '4) CJEU tariff classification judgment {YEAR}  ' +
-              '5) EU customs classification regulation news. ' +
-              'Capture the CELEX number (e.g. 3{YEAR}Rxxxx) or case number (e.g. C-123/25) as ruling_number, the EUR-Lex/CURIA URL, and the CN code.'
-  },
-  {
-    category: '유럽', region: 'EU(회원국)', countryName: 'EU',
-    source  : 'EU 회원국 분류 판결·분쟁 / 로펌 얼럿',
-    prompt  : 'Goal: find EU MEMBER-STATE customs classification court decisions, disputes, and professional alerts in the last {DAYS} days. ' +
-              'Search strategy (run each): ' +
-              '1) Lexology OR Mondaq EU tariff classification BTI {YEAR}  ' +
+              '1) site:curia.europa.eu Combined Nomenclature judgment  ' +
               '2) German: Zolltarif Einreihung Urteil Finanzgericht {YEAR}  ' +
-              '3) Dutch: indeling gecombineerde nomenclatuur uitspraak  ' +
-              '4) French: classement tarifaire arrêt douane  ' +
-              '5) EU customs classification dispute news {YEAR}. ' +
-              'Note: the EBTI database itself is behind a search form and NOT indexed by Google — court decisions, ' +
-              'national customs bulletins and law-firm alerts are the findable sources. ' +
-              'Put the member state name in title_en; keep country as EU.'
-  },
-  {
-    category: '유럽', region: '영국',
-    source  : 'UK First-tier Tribunal 분류 판결',
-    prompt  : 'Goal: find UK tariff classification decisions in the last {DAYS} days — primarily First-tier Tribunal (Tax Chamber) and Upper Tribunal customs classification judgments. ' +
-              'Search strategy (run each): ' +
-              '1) First-tier Tribunal tariff classification decision {YEAR}  ' +
-              '2) site:gov.uk tribunal customs classification decision  ' +
-              '3) site:bailii.org customs tariff classification  ' +
-              '4) UK commodity code classification appeal news  ' +
-              '5) UK customs classification law firm alert {YEAR}. ' +
-              'Note: HMRC Advance Tariff Rulings are NOT published individually — tribunal judgments and professional press are the findable sources.'
+              '3) Dutch: indeling gecombineerde nomenclatuur uitspraak / French: classement tarifaire arrêt  ' +
+              '4) UK First-tier Tribunal tariff classification decision {YEAR}  ' +
+              '5) Lexology OR Mondaq EU BTI tariff classification. ' +
+              'Note: the EBTI database is NOT indexed by Google; HMRC ATaR rulings are not published — courts and press are the findable sources. ' +
+              'Use EU or 영국 in the country field (member-state name goes in title_en).'
   },
 
-  // ── 중동 ──
+  // ── 중동 (통합) ──
   {
-    category: '중동', region: '사우디아라비아/UAE', isGroup: true,
-    countries: ['사우디아라비아', 'UAE'],
-    source  : 'ZATCA(사우디) / UAE FCA',
-    prompt  : 'Goal: find tariff classification decisions or reported cases from Saudi Arabia or UAE in the last {DAYS} days. ' +
-              'Search strategy (run each): ' +
+    category: '중동', region: '중동', isGroup: true,
+    countries: ['사우디아라비아', 'UAE', '튀르키예', '이집트', '요르단', '이라크', '모로코', '튀니지', '알제리', '파키스탄', '이스라엘'],
+    source  : 'ZATCA / 두바이세관 / 튀르키예 GTB / 중동·북아프리카 관세당국',
+    prompt  : 'Goal: find tariff classification decisions or reported cases across the Middle East in the last {DAYS} days ' +
+              '(Saudi Arabia, UAE, Türkiye, Egypt, Jordan, Iraq, Morocco, Tunisia, Algeria, Pakistan, Israel). ' +
+              'Search strategy (one per language bloc, run each): ' +
               '1) Arabic: تصنيف جمركي قرار {YEAR}  ' +
-              '2) ZATCA classification decision news  ' +
-              '3) Dubai Customs classification notice  ' +
-              '4) GCC customs classification news {YEAR}  ' +
-              '5) English: Saudi OR UAE customs classification ruling. ' +
-              'Use the actual country name (사우디아라비아 / UAE) in the country field.'
-  },
-  {
-    category: '중동', region: '튀르키예',
-    source  : 'Ticaret Bakanlığı / 행정법원 판결',
-    prompt  : 'Goal: find Turkish tariff classification decisions in the last {DAYS} days. ' +
-              'Search strategy (run each, IN TURKISH): ' +
-              '1) bağlayıcı tarife bilgisi kararı {YEAR}  ' +
-              '2) gümrük tarife sınıflandırma kararı  ' +
-              '3) site:ticaret.gov.tr tarife sınıflandırma  ' +
-              '4) Danıştay gümrük tarife pozisyonu karar (행정법원 분류 판결)  ' +
-              '5) English supplement: Turkey customs classification ruling {YEAR}.'
-  },
-  {
-    category: '중동', region: '이집트/요르단/이라크/모로코/파키스탄/이스라엘', isGroup: true,
-    countries: ['이집트', '요르단', '이라크', '모로코', '튀니지', '알제리', '파키스탄', '이스라엘'],
-    source  : '이집트 / 요르단 / 이라크 / 모로코 / 튀니지 / 알제리 / 파키스탄 / 이스라엘',
-    prompt  : 'Goal: find tariff classification decisions or reported cases from Egypt, Jordan, Iraq, Morocco, Tunisia, Algeria, Pakistan, or Israel in the last {DAYS} days. ' +
-              'Search strategy (one search per language bloc, run each): ' +
-              '1) Arabic sweep: تصنيف جمركي قرار (Egypt/Jordan/Iraq)  ' +
-              '2) French sweep: classification tarifaire douane décision (Morocco/Tunisia/Algeria)  ' +
-              '3) Pakistan FBR classification ruling OR "Customs Appellate Tribunal" classification  ' +
-              '4) Israel customs classification ruling news  ' +
-              '5) English sweep: Middle East customs classification decision {YEAR}. ' +
+              '2) Turkish: bağlayıcı tarife bilgisi OR tarife sınıflandırma kararı  ' +
+              '3) Turkish courts: Danıştay gümrük tarife pozisyonu karar  ' +
+              '4) Pakistan FBR OR "Customs Appellate Tribunal" classification  ' +
+              '5) English sweep: Middle East customs classification ruling {YEAR}. ' +
               'Most of these countries do not publish rulings — news and tribunal reports are the findable sources. ' +
-              'Use the actual country name (이집트 / 요르단 / 이라크 / 모로코 / 튀니지 / 알제리 / 파키스탄 / 이스라엘) in the country field.'
+              'Use the actual country name (사우디아라비아 / UAE / 튀르키예 / 이집트 / 요르단 / 이라크 / 모로코 / 튀니지 / 알제리 / 파키스탄 / 이스라엘) in the country field.'
   },
 
-  // ── 동남아/오세아니아 ──
+  // ── 동남아/오세아니아 (통합) ──
   {
-    category: '동남아', region: '인도네시아/말레이시아/태국', isGroup: true,
-    countries: ['인도네시아', '말레이시아', '태국'],
-    source  : '인도네시아 Bea Cukai / 말레이시아 Royal Customs / 태국 Customs',
-    prompt  : 'Goal: find tariff classification decisions from Indonesia, Malaysia, or Thailand in the last {DAYS} days. ' +
-              'Search strategy (one search per country language, run each): ' +
-              '1) Indonesian: penetapan klasifikasi barang keputusan {YEAR} (site:beacukai.go.id 우선)  ' +
-              '2) Malay: ketetapan kastam penjenisan barang  ' +
-              '3) Thai: พิกัดศุลกากร คำวินิจฉัย  ' +
-              '4) English sweep: Indonesia OR Malaysia OR Thailand customs classification ruling {YEAR}  ' +
-              '5) ASEAN trade press classification news. ' +
-              'Use the actual country name (인도네시아 / 말레이시아 / 태국) in the country field.'
-  },
-  {
-    // 베트남은 분류 결정문(thông báo kết quả phân loại) 공개가 활발한 고수율 지역 — 단독 패스로 분리
-    category: '동남아', region: '베트남', countryName: '베트남',
-    source  : 'Vietnam Customs 분류 결정문',
-    prompt  : 'Goal: find ALL Vietnamese customs classification decisions in the last {DAYS} days. ' +
-              'Vietnam actively publishes classification result notices (thông báo kết quả phân loại) — search IN VIETNAMESE: ' +
-              '1) site:customs.gov.vn "phân loại" quyết định  ' +
-              '2) "thông báo kết quả phân loại" {YEAR}  ' +
-              '3) "quyết định phân loại hàng hóa" hải quan  ' +
-              '4) phân loại mã HS tranh chấp hải quan (분쟁·뉴스)  ' +
-              '5) English supplement: Vietnam customs classification decision {YEAR}.'
-  },
-  {
-    category: '동남아', region: '필리핀/싱가포르', isGroup: true,
-    countries: ['필리핀', '싱가포르'],
-    source  : '필리핀 Tariff Commission / 싱가포르 Customs',
-    prompt  : 'Goal: find tariff classification rulings from the Philippines or Singapore in the last {DAYS} days. ' +
-              'Search strategy (run each): ' +
-              '1) site:tariffcommission.gov.ph ruling classification  ' +
-              '2) Philippine tariff classification ruling {YEAR}  ' +
-              '3) Singapore customs classification news {YEAR}  ' +
-              '4) Philippines BOC classification decision news. ' +
-              'Use the actual country name (필리핀 / 싱가포르) in the country field.'
-  },
-  {
-    category: '동남아', region: '호주/뉴질랜드', isGroup: true,
-    countries: ['호주', '뉴질랜드'],
-    source  : 'ABF / AAT 심판 / NZ Customs',
-    prompt  : 'Goal: find tariff classification decisions from Australia or New Zealand in the last {DAYS} days. ' +
-              'Search strategy (run each): ' +
-              '1) site:abf.gov.au tariff classification (advice/gazette)  ' +
-              '2) AAT tribunal tariff classification decision {YEAR} (호주 행정심판 분류 판결)  ' +
-              '3) Australia tariff classification precedent news  ' +
-              '4) New Zealand customs classification ruling news {YEAR}. ' +
-              'Use the actual country name (호주 / 뉴질랜드) in the country field.'
+    category: '동남아', region: '동남아/오세아니아', isGroup: true,
+    countries: ['베트남', '인도네시아', '말레이시아', '태국', '필리핀', '싱가포르', '호주', '뉴질랜드'],
+    source  : '베트남 분류결정문 / Bea Cukai / Tariff Commission / ABF·AAT',
+    prompt  : 'Goal: find tariff classification decisions across Southeast Asia and Oceania in the last {DAYS} days ' +
+              '(Vietnam, Indonesia, Malaysia, Thailand, Philippines, Singapore, Australia, New Zealand). ' +
+              'Search strategy (one per language, run each): ' +
+              '1) Vietnamese: "thông báo kết quả phân loại" OR "quyết định phân loại hàng hóa" (site:customs.gov.vn 우선)  ' +
+              '2) Indonesian: penetapan klasifikasi barang keputusan {YEAR}  ' +
+              '3) Thai: พิกัดศุลกากร คำวินิจฉัย / Malay: ketetapan kastam penjenisan  ' +
+              '4) site:tariffcommission.gov.ph ruling OR AAT tribunal tariff classification decision  ' +
+              '5) English sweep: ASEAN OR Australia OR "New Zealand" customs classification ruling {YEAR}. ' +
+              'Vietnam publishes classification result notices actively — prioritize Vietnamese searches. ' +
+              'Use the actual country name (베트남 / 인도네시아 / 말레이시아 / 태국 / 필리핀 / 싱가포르 / 호주 / 뉴질랜드) in the country field.'
   },
 
   // ── 아프리카 ──
@@ -671,16 +516,15 @@ var MONITORING_REGIONS = [
     source  : 'SARS(남아공) / Nigeria Customs / KRA(케냐)',
     prompt  : 'Goal: find tariff classification decisions or reported cases from South Africa, Nigeria, or Kenya in the last {DAYS} days. ' +
               'Search strategy (run each): ' +
-              '1) site:sars.gov.za tariff classification (determinations/letters)  ' +
+              '1) site:sars.gov.za tariff classification  ' +
               '2) South Africa tariff classification court judgment {YEAR}  ' +
               '3) Nigeria customs classification decision news  ' +
               '4) Kenya KRA customs classification ruling news  ' +
               '5) Africa customs classification dispute {YEAR}. ' +
-              'Most rulings are not published individually — court judgments and news are the findable sources. ' +
               'Use the actual country name (남아프리카공화국 / 나이지리아 / 케냐) in the country field.'
   },
 
-  // ── CIS ── (개별 결정은 비공개가 많음 — 정기 공표되는 EAEU(ЕЭК) 분류결정을 1차 소스로 재조준)
+  // ── CIS (EAEU 분류결정 중심) ──
   {
     category: 'CIS', region: 'CIS', isGroup: true,
     countries: ['러시아', '카자흐스탄', '우즈베키스탄'],
@@ -693,8 +537,7 @@ var MONITORING_REGIONS = [
               '3) классификационное решение ТН ВЭД {YEAR}  ' +
               '4) ФТС классификация товара решение новости  ' +
               '5) English supplement: EAEU classification decision {YEAR}. ' +
-              'EAEU-wide decisions apply to all member states — use 러시아 as country for EAEU decisions unless a specific state is named. ' +
-              'Use the actual country name (러시아 / 카자흐스탄 / 우즈베키스탄) in the country field.'
+              'Use the actual country name (러시아 / 카자흐스탄 / 우즈베키스탄) in the country field (EAEU-wide → 러시아).'
   },
 
   // ── 글로벌 (통상 전문지/WCO — 공식 DB 미공개 국가 보완) ──
@@ -707,8 +550,8 @@ var MONITORING_REGIONS = [
               '1) site:lexology.com tariff classification ruling {YEAR}  ' +
               '2) site:mondaq.com customs classification  ' +
               '3) WCO HS classification decisions news  ' +
-              '4) customs classification dispute court decision {YEAR}  ' +
-              '5) trade alert tariff classification (KPMG OR EY OR Deloitte OR PwC OR "Sandler Travis"). ' +
+              '4) trade alert tariff classification (KPMG OR EY OR Deloitte OR PwC OR "Sandler Travis")  ' +
+              '5) customs classification dispute court decision {YEAR}. ' +
               'Do NOT report routine CBP CROSS ruling letters (collected separately). ' +
               'Use the actual country name in KOREAN in the country field (예: 미국, 독일, 인도, 베트남).'
   }
@@ -935,14 +778,10 @@ function runHSRulingMonitor() {
 
   Logger.log('[HSRulingMonitor] 실행 시작: ' + dateRangeStr);
 
-  var requests = MONITORING_REGIONS.map(function(r) {
-    return _buildRequest(r, apiKey, dateRangeStr, today.getFullYear());
-  });
-
-  // 배치 단위로 호출 + 429/5xx 재시도 (rate limit 대응)
-  var responses = _fetchAllInBatches(requests);
-
   var allResults = [];
+
+  // ── 실행 순서: 무료·고속 직수집(공식 API·RSS)을 먼저 확보하고, 시간이 많이 드는
+  //    Gemini 그라운딩은 남은 예산으로 수행 — 시간 초과 시에도 직수집분은 반드시 발송된다. ──
 
   // ── 공식 API 직접 수집 (하이브리드) — 영구 원문 URL + 대량 수집 ──
   if (USE_CBP_API) {
@@ -980,6 +819,14 @@ function runHSRulingMonitor() {
       Logger.log('[뉴스 RSS] ' + rss.length + '건 수집 (' + RSS_SOURCES.length + '개 피드)');
     } catch (e) { Logger.log('[뉴스 RSS] 오류: ' + e.message); }
   }
+
+  // ── Gemini 그라운딩 보완 수집 — 직수집 확보 후 남은 시간예산으로 실행 ──
+  Logger.log('[HSRulingMonitor] 직수집 완료(' + allResults.length + '건, ' +
+             Math.round(_elapsedMs() / 1000) + '초 경과) — Gemini ' + MONITORING_REGIONS.length + '개 패스 시작');
+  var requests = MONITORING_REGIONS.map(function(r) {
+    return _buildRequest(r, apiKey, dateRangeStr, today.getFullYear());
+  });
+  var responses = _fetchAllInBatches(requests);
 
   responses.forEach(function(resp, i) {
     var region = MONITORING_REGIONS[i];
@@ -1060,6 +907,12 @@ function _fetchAllInBatches(requests) {
   var responses = new Array(requests.length);
 
   for (var start = 0; start < requests.length; start += API_BATCH_SIZE) {
+    // 시간예산 소진 시 나머지 배치 생략 — 이미 받은 응답만으로 진행 (전체 유실 방지)
+    if (start > 0 && _budgetLeft() < RETRY_TIME_RESERVE_MS) {
+      Logger.log('[fetchAll] 시간예산 부족 — 배치 ' + Math.ceil(start / API_BATCH_SIZE) + '개 실행 후 중단 (' +
+                 (requests.length - start) + '건 생략)');
+      break;
+    }
     var batch = requests.slice(start, start + API_BATCH_SIZE);
     var batchResp;
     try {
@@ -1183,7 +1036,7 @@ function _collectCbpRulings(periodStart) {
     var kept = 0;
 
     rulings.forEach(function(r) {
-      if (kept >= CBP_MAX_PER_TERM) return;
+      if (kept >= CBP_MAX_PER_TERM || out.length >= CBP_MAX_TOTAL) return;
       var num  = r.rulingNumber || r.ruling_number || r.number || r.RulingNumber || '';
       if (!num || bySeen[num]) return;
 
@@ -2159,7 +2012,7 @@ function _buildRequest(region, apiKey, dateRangeStr, year) {
       { role: 'user', parts: [{ text: userPrompt }] }
     ],
     tools: [{ google_search: {} }],
-    generationConfig: { temperature: 0, maxOutputTokens: 16384 }
+    generationConfig: { temperature: 0, maxOutputTokens: 8192 }  // 25건 JSON에 충분 — 출력 토큰 비용 절감
   };
 
   return {
