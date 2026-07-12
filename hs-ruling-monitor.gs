@@ -2,6 +2,17 @@
  * HS Code 유권해석(Ruling) 주간 모니터링 시스템
  * ─────────────────────────────────────────────
  * [변경 이력]
+ * v4.8 (표시 품질 + 소스 균형 + 직수집기 침묵실패 진단)
+ *  - [표시] "제목 없음" 노출 수정: 한국어 제목이 없으면 원문 제목을 메인으로 표시(부제 중복 제거)
+ *  - [번역] 발송 전 한국어 번역 단계(_translateToKorean, LanguageApp 내장 번역):
+ *      한국어 제목이 없는 항목의 제목·요약을 한국어화 (원문은 title_en에 보존, 실패해도 발송 진행)
+ *  - [균형] RSS 국가당 총량 캡(RSS_MAX_PER_COUNTRY=12) + 피드별 max — 인도(피드 3개) 편중 방지,
+ *      인도 쿼리·필터 정밀화 ("tariff classification"/"advance ruling" 한정)
+ *  - [진단] CBP 0건 대응: 전량 실패 시 최소 파라미터(term/pageSize/page)로 자동 재시도 +
+ *      첫 실패 응답/구조를 로그로 남겨 필드 보정 가능하게
+ *  - [진단] EUR-Lex 0건 대응: 타입 불일치에 취약한 SPARQL 날짜 FILTER 제거(최신순 LIMIT + 클라이언트
+ *      기간 필터로 대체), 0건 시 응답 앞부분 진단 로그
+ *
  * v4.7 (링크 정확도 + 같은 사건 중복 병합)
  *  - [링크 정확도] "Page not found" 방지: 접속 검증을 실제로 통과(OK/OK(API))했거나 항상 유효한
  *      리다이렉터(news.google.com)인 URL만 원문 링크로 노출(_isLinkTrusted). 미검증/SKIP URL은
@@ -173,6 +184,10 @@ var MONITORING_DAYS = 30;   // 조회기간 — dedup이 있으므로 넓혀도 
 // false : 정확성 우선 — 기존 v4.2~4.3 동작 (스코프 미달·미검증 AI검색 항목 제외)
 var RECALL_MODE = true;
 
+// 발송 전 한국어 번역 (RSS·해외 소스 항목의 제목/요약) — Apps Script 내장 LanguageApp 사용
+var TRANSLATE_TO_KO = true;
+var TRANSLATE_MAX   = 80;   // 실행당 번역 호출 상한 (LanguageApp 일일 쿼터 보호)
+
 // API 호출 배치 크기/대기 — 무료 등급은 분당 요청 제한이 낮으므로 배치로 나눠 호출
 var API_BATCH_SIZE     = 7;
 var API_BATCH_PAUSE_MS = 2000;
@@ -204,7 +219,8 @@ var USE_FEDERAL_REGISTER = true;   // 美 Federal Register API (무인증) — C
 var USE_EU_EURLEX        = true;   // EU EUR-Lex(CELLAR SPARQL) 분류규칙 직수집 (무인증, best-effort)
 var USE_UK_GOVUK         = true;   // 英 GOV.UK Search API — 분류 심판결정/가이던스 (무인증, 영구 URL)
 var USE_RSS_NEWS         = true;   // Google News RSS + 전문지 RSS 직수집 — 전 지역 뉴스를 결정적으로 수집
-var RSS_MAX_PER_FEED     = 20;     // RSS 피드당 채택 상한
+var RSS_MAX_PER_FEED     = 20;     // RSS 피드당 채택 상한 (소스별 max로 개별 조정 가능)
+var RSS_MAX_PER_COUNTRY  = 12;     // RSS 국가당 총 채택 상한 — 특정 국가(피드 다수) 편중 방지
 var CBP_PAGE_SIZE        = 50;     // CBP 검색어당 페이지 크기 (최신순)
 var CBP_PAGES            = 2;      // 검색어당 조회 페이지 수 — 2면 최대 100건/검색어
 var CBP_MAX_PER_TERM     = 100;    // 검색어당 기간 내 채택 상한
@@ -290,12 +306,13 @@ var RSS_SOURCES = [
     url: _gnews('"classificação fiscal" OR "Solução de Consulta" NCM', 'pt-BR', 'BR', 'BR:pt-419') },
   { category: '중남미', country: '멕시코', name: 'Google News México',
     url: _gnews('"clasificación arancelaria"', 'es-419', 'MX', 'MX:es-419') },
-  { category: '인도',   country: '인도',   name: 'Google News India',
-    url: _gnews('customs classification ruling OR CAAR', 'en-IN', 'IN', 'IN:en') },
-  { category: '인도',   country: '인도',   name: 'Taxscan RSS',
-    filter: /classif|caar|cestat|customs|tariff/i, url: 'https://www.taxscan.in/feed/' },
-  { category: '인도',   country: '인도',   name: 'TaxGuru RSS',
-    filter: /classif|caar|cestat|customs|tariff/i, url: 'https://taxguru.in/feed/' },
+  // 인도는 피드가 3개라 편중되기 쉬움 — 피드별 max로 억제 + 분류 관련성 필터 강화
+  { category: '인도',   country: '인도',   name: 'Google News India', max: 6,
+    url: _gnews('"tariff classification" OR "advance ruling" customs', 'en-IN', 'IN', 'IN:en') },
+  { category: '인도',   country: '인도',   name: 'Taxscan RSS', max: 4,
+    filter: /classif|caar|tariff heading|hsn/i, url: 'https://www.taxscan.in/feed/' },
+  { category: '인도',   country: '인도',   name: 'TaxGuru RSS', max: 4,
+    filter: /classif|caar|tariff heading|hsn/i, url: 'https://taxguru.in/feed/' },
   { category: '중동',   country: '튀르키예', name: 'Google News Türkiye',
     url: _gnews('"tarife sınıflandırma" OR "bağlayıcı tarife bilgisi"', 'tr', 'TR', 'TR:tr') },
   { category: 'CIS',    country: '러시아', name: 'Google News Россия',
@@ -1005,6 +1022,9 @@ function runHSRulingMonitor() {
   // 4차: 미검증 AI검색 항목 처리 (RECALL_MODE면 태깅만, 아니면 제외)
   var refined = _applyUnverifiedDrop(uniq);
 
+  // 5차: 한국어 제목/요약 보강 — RSS·해외 소스 항목의 "제목 없음"/미번역 노출 방지
+  _translateToKorean(refined);
+
   // 수집 파이프라인 통계 — 메일 헤더에 표기해 "어디서 몇 건이 걸러졌는지" 가시화
   var stats = {
     collected : allResults.length,
@@ -1114,8 +1134,28 @@ function _collectCbpRulings(periodStart) {
   // 배치 분할 + 429/5xx 재시도 재사용 (원래 단일 fetchAll은 재시도 없이 조용히 전체 실패했음)
   var resps = _fetchAllInBatches(reqs);
 
+  // 전량 실패(0/전체 200) 시 — sortBy/collection 파라미터가 API와 안 맞을 가능성 →
+  // 최소 파라미터(term/pageSize/page)로 1회 재시도하고, 첫 실패 응답을 진단 로그로 남긴다.
+  var okCount = resps.filter(function(r) { return r && r.getResponseCode() === 200; }).length;
+  if (okCount === 0 && resps.length) {
+    var f = resps.filter(function(r) { return r; })[0];
+    if (f) Logger.log('[CBP] 전량 실패 — 첫 응답 HTTP ' + f.getResponseCode() + ': ' +
+                      f.getContentText().substring(0, 200));
+    Logger.log('[CBP] 최소 파라미터로 재시도');
+    reqs = reqMeta.map(function(m) {
+      return {
+        url: 'https://rulings.cbp.gov/api/search?term=' + encodeURIComponent(m.term) +
+             '&pageSize=' + CBP_PAGE_SIZE + '&page=' + m.page,
+        method: 'get', muteHttpExceptions: true,
+        headers: { 'Accept': 'application/json' }
+      };
+    });
+    resps = _fetchAllInBatches(reqs);
+  }
+
   var bySeen = {};   // ruling number 기준 중복 제거 (검색어/페이지 간)
   var out    = [];
+  var diagLogged = false;
 
   resps.forEach(function(resp, ti) {
     if (!resp || resp.getResponseCode() !== 200) {
@@ -1125,6 +1165,12 @@ function _collectCbpRulings(periodStart) {
     var data;
     try { data = JSON.parse(resp.getContentText()); } catch (e) { return; }
     var rulings = data.rulings || data.results || data.Rulings || (data.data && data.data.rulings) || [];
+    // 200인데 배열을 못 찾으면 응답 구조가 다른 것 — 최초 1회 구조를 로그로 남겨 필드 보정에 사용
+    if (!rulings.length && !diagLogged) {
+      diagLogged = true;
+      Logger.log('[CBP][진단] 최상위 키: ' + Object.keys(data).join(', ') +
+                 ' | 응답 앞부분: ' + resp.getContentText().substring(0, 300));
+    }
     var kept = 0;
 
     rulings.forEach(function(r) {
@@ -1249,16 +1295,16 @@ function _collectFederalRegister(periodStart) {
  *   testEuEurlex()로 실제 응답 구조 확인 가능.
  */
 function _collectEuClassificationRegs(periodStart) {
+  // 날짜 FILTER는 리터럴 타입(xsd:date vs string)이 어긋나면 조용히 0건이 되므로 SPARQL에서 빼고,
+  // 최신순 LIMIT로 받아 클라이언트에서 기간 필터링한다 (분류규칙은 연 ~30건이라 LIMIT로 충분).
   var sparql =
     'PREFIX cdm: <http://publications.europa.eu/ontology/cdm#> ' +
-    'PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> ' +
     'SELECT DISTINCT ?celex ?title ?date WHERE { ' +
     '  ?work cdm:resource_legal_id_celex ?celex . ' +
     '  ?work cdm:work_date_document ?date . ' +
     '  ?exp cdm:expression_belongs_to_work ?work . ' +
     '  ?exp cdm:expression_title ?title . ' +
     '  FILTER(CONTAINS(LCASE(STR(?title)), "classification of certain goods in the combined nomenclature")) ' +
-    '  FILTER(?date >= "' + _fmtDate(periodStart) + '"^^xsd:date) ' +
     '} ORDER BY DESC(?date) LIMIT ' + EURLEX_MAX;
 
   var url = 'https://publications.europa.eu/webapi/rdf/sparql?query=' +
@@ -1275,14 +1321,24 @@ function _collectEuClassificationRegs(periodStart) {
 
   var bindings;
   try { bindings = JSON.parse(resp.getContentText()).results.bindings; }
-  catch (e) { Logger.log('[EU EUR-Lex] 파싱 오류'); return []; }
+  catch (e) {
+    Logger.log('[EU EUR-Lex] 파싱 오류 — 응답 앞부분: ' + resp.getContentText().substring(0, 200));
+    return [];
+  }
+  if (!bindings || !bindings.length) {
+    Logger.log('[EU EUR-Lex][진단] 결과 0건 — 응답 앞부분: ' + resp.getContentText().substring(0, 300) +
+               ' (술어명(cdm) 변동 가능성 — testEuEurlex() 실행 후 확인)');
+    return [];
+  }
 
+  var sinceStr = _fmtDate(periodStart);
   var seen = {}, out = [];
-  (bindings || []).forEach(function(b) {
+  bindings.forEach(function(b) {
     var celex = b.celex && b.celex.value ? b.celex.value : '';
     var title = b.title && b.title.value ? b.title.value : '';
     var date  = b.date && b.date.value ? String(b.date.value).substring(0, 10) : '';
     if (!celex || seen[celex]) return;
+    if (date && date < sinceStr) return;   // 기간 필터 (ISO 문자열 비교)
     seen[celex] = true;
 
     var item = {
@@ -1378,6 +1434,7 @@ function _collectRssNews(periodStart) {
   var resps = _fetchAllInBatches(reqs);
 
   var out = [];
+  var byCountry = {};   // 국가당 총량 캡 — 피드가 여러 개인 국가(인도 등)의 편중 방지
   resps.forEach(function(resp, i) {
     var src = RSS_SOURCES[i];
     if (!resp || resp.getResponseCode() !== 200) {
@@ -1394,8 +1451,10 @@ function _collectRssNews(periodStart) {
       return;
     }
 
+    var feedCap = src.max || RSS_MAX_PER_FEED;
     var kept = 0;
-    for (var j = 0; j < items.length && kept < RSS_MAX_PER_FEED; j++) {
+    for (var j = 0; j < items.length && kept < feedCap; j++) {
+      if ((byCountry[src.country] || 0) >= RSS_MAX_PER_COUNTRY) break;
       var el    = items[j];
       var title = String(el.getChildText('title') || '').trim();
       var link  = String(el.getChildText('link') || '').trim();
@@ -1418,6 +1477,7 @@ function _collectRssNews(periodStart) {
       if (POLICY_EXCLUDE_TERMS.some(function(t) { return lowT.indexOf(t.trim()) !== -1; })) continue;
 
       kept++;
+      byCountry[src.country] = (byCountry[src.country] || 0) + 1;
       var item = {
         category       : src.category,
         country        : src.country,
@@ -1611,6 +1671,39 @@ function _jaccard(a, b) {
   for (k in a) { uni++; if (b[k]) inter++; }
   for (k in b) { if (!a[k]) uni++; }
   return uni ? inter / uni : 0;
+}
+
+// ─── 한국어 번역 보강 ────────────────────────────────────────────────────────
+
+function _hasHangul(s) { return /[가-힣]/.test(String(s || '')); }
+
+/**
+ * 발송 직전, 한국어 제목이 없는 항목의 제목·요약을 LanguageApp(구글 번역 내장)으로 한국어화.
+ * 원문 제목은 title_en에 그대로 보존되므로 정보 손실 없음. 쿼터/시간예산 내에서만 수행하고,
+ * 오류 시 조용히 중단(번역은 부가 기능 — 실패해도 발송은 진행).
+ */
+function _translateToKorean(items) {
+  if (!TRANSLATE_TO_KO) return;
+  var calls = 0;
+  for (var i = 0; i < items.length; i++) {
+    if (calls >= TRANSLATE_MAX) { Logger.log('[translate] 상한 도달(' + TRANSLATE_MAX + ') — 이후 항목 생략'); break; }
+    if (_budgetLeft() < 15000) { Logger.log('[translate] 시간예산 부족 — 중단'); break; }
+    var it = items[i];
+    try {
+      if (!it.title && it.title_en && !_hasHangul(it.title_en)) {
+        it.title = LanguageApp.translate(String(it.title_en).substring(0, 200), '', 'ko');
+        calls++;
+      }
+      if (it.summary && !_hasHangul(it.summary)) {
+        it.summary = LanguageApp.translate(String(it.summary).substring(0, 180), '', 'ko');
+        calls++;
+      }
+    } catch (e) {
+      Logger.log('[translate] 오류 — 이후 번역 생략: ' + e.message);
+      break;
+    }
+  }
+  if (calls) Logger.log('[translate] ' + calls + '개 필드 한국어 번역 완료');
 }
 
 /** 대표 항목 점수: 공식 > 뉴스RSS > AI검색 → 중요도 → 검증된 링크 보유 → 요약 길이 */
@@ -2297,12 +2390,16 @@ function _buildItemCard(item) {
     badges += '<span style="font-size:11px;color:#8a93a3;">[' + _escapeHtml(item.ruling_number) + ']</span>';
   }
 
-  var titleKo   = _escapeHtml(item.title || item.product_name || '제목 없음');
-  var titleEn   = _escapeHtml(item.title_en || item.product_name_en || '');
+  // 메인 제목: 한국어 제목 → 원문 제목 순으로 폴백 ("제목 없음" 노출 방지).
+  // 부제목(원문)은 메인이 한국어일 때만 표시해 같은 문구가 두 번 나오지 않게 한다.
+  var koText   = item.title || item.product_name || '';
+  var enText   = item.title_en || item.product_name_en || '';
+  var mainText = _escapeHtml(koText || enText || '(제목 정보 없음)');
+  var titleEn  = (koText && enText) ? _escapeHtml(enText) : '';
   var directUrl = _directOriginalUrl(item);
   var titleHtml = directUrl
-    ? '<a href="' + _escapeHtml(directUrl) + '" target="_blank" style="color:#15418c;text-decoration:underline;">' + titleKo + '</a>'
-    : '<span style="color:#1f2733;">' + titleKo + '</span>';
+    ? '<a href="' + _escapeHtml(directUrl) + '" target="_blank" style="color:#15418c;text-decoration:underline;">' + mainText + '</a>'
+    : '<span style="color:#1f2733;">' + mainText + '</span>';
 
   return '<table width="100%" cellpadding="0" cellspacing="0" border="0" ' +
          'style="border:1px solid #dde1e7;background-color:#ffffff;">' +
