@@ -2,6 +2,13 @@
  * HS Code 유권해석(Ruling) 주간 모니터링 시스템
  * ─────────────────────────────────────────────
  * [변경 이력]
+ * v4.9 (실측 로그 기반 직수집기 수정 — CBP 페이지 인덱스 / EUR-Lex 성능)
+ *  - [CBP] 실측 진단({"rulings":[],"totalHits":28})으로 page 파라미터가 0-인덱스임을 확인 —
+ *      page=1,2 → page=0,1로 수정. 그동안 모든 검색어가 빈 페이지를 받아 0건이었음.
+ *  - [EUR-Lex] CONTAINS(제목) 풀스캔으로 호출당 2분+ 소요·타임아웃 → 쿼리 재설계:
+ *      좁히는 조건(문서유형 REG_IMPL, 기간 xsd:date, 영어 표현)을 먼저 걸고 제목 필터는 마지막에.
+ *      1차(REG_IMPL 한정) 0건 시 2차(문서유형 무제한, 기간·언어 유지) 폴백. 서버 타임아웃 30초 지정.
+ *
  * v4.8 (표시 품질 + 소스 균형 + 직수집기 침묵실패 진단)
  *  - [표시] "제목 없음" 노출 수정: 한국어 제목이 없으면 원문 제목을 메인으로 표시(부제 중복 제거)
  *  - [번역] 발송 전 한국어 번역 단계(_translateToKorean, LanguageApp 내장 번역):
@@ -1117,10 +1124,12 @@ function _fetchAllInBatches(requests) {
  * ※ CBP API 응답 필드명은 변동 가능 → 여러 후보 필드명을 폴백 처리. testCbpApi()로 실제 구조 확인 가능.
  */
 function _collectCbpRulings(periodStart) {
-  // 검색어 × 페이지 조합으로 요청 생성 (CBP_PAGES=2면 검색어당 최대 100건 조회)
+  // 검색어 × 페이지 조합으로 요청 생성.
+  // ※ CROSS API의 page는 0부터 시작 (실측: totalHits>0인데 page=1이 빈 배열 → 0-인덱스 확인)
+  //    CBP_PAGES=2면 page 0,1 요청 = 검색어당 최대 100건.
   var reqMeta = [];
   CBP_SEARCH_TERMS.forEach(function(term) {
-    for (var p = 1; p <= CBP_PAGES; p++) reqMeta.push({ term: term, page: p });
+    for (var p = 0; p < CBP_PAGES; p++) reqMeta.push({ term: term, page: p });
   });
   var reqs = reqMeta.map(function(m) {
     return {
@@ -1294,40 +1303,60 @@ function _collectFederalRegister(periodStart) {
  * ※ EU 온톨로지(cdm) 술어명은 변동 가능 → 실패 시 graceful(빈 배열) 반환, Gemini EU 패스가 보완.
  *   testEuEurlex()로 실제 응답 구조 확인 가능.
  */
-function _collectEuClassificationRegs(periodStart) {
-  // 날짜 FILTER는 리터럴 타입(xsd:date vs string)이 어긋나면 조용히 0건이 되므로 SPARQL에서 빼고,
-  // 최신순 LIMIT로 받아 클라이언트에서 기간 필터링한다 (분류규칙은 연 ~30건이라 LIMIT로 충분).
-  var sparql =
-    'PREFIX cdm: <http://publications.europa.eu/ontology/cdm#> ' +
-    'SELECT DISTINCT ?celex ?title ?date WHERE { ' +
-    '  ?work cdm:resource_legal_id_celex ?celex . ' +
-    '  ?work cdm:work_date_document ?date . ' +
-    '  ?exp cdm:expression_belongs_to_work ?work . ' +
-    '  ?exp cdm:expression_title ?title . ' +
-    '  FILTER(CONTAINS(LCASE(STR(?title)), "classification of certain goods in the combined nomenclature")) ' +
-    '} ORDER BY DESC(?date) LIMIT ' + EURLEX_MAX;
-
+/** CELLAR SPARQL 실행 → bindings 배열 반환 (실패 시 null, 0건이면 []) */
+function _eurlexQuery(sparql, label) {
   var url = 'https://publications.europa.eu/webapi/rdf/sparql?query=' +
-            encodeURIComponent(sparql) + '&format=application%2Fsparql-results%2Bjson';
+            encodeURIComponent(sparql) + '&format=application%2Fsparql-results%2Bjson' +
+            '&timeout=30000';   // 서버측 타임아웃 30초 — 풀스캔성 쿼리가 2분+ 매달리는 것 방지
 
   var resp;
   try { resp = UrlFetchApp.fetch(url, { method: 'get', muteHttpExceptions: true,
                                         headers: { 'Accept': 'application/sparql-results+json' } }); }
-  catch (e) { Logger.log('[EU EUR-Lex] fetch 오류: ' + e.message); return []; }
+  catch (e) { Logger.log('[EU EUR-Lex] fetch 오류(' + label + '): ' + e.message); return null; }
   if (resp.getResponseCode() !== 200) {
-    Logger.log('[EU EUR-Lex] HTTP ' + resp.getResponseCode() + ' — Gemini EU 패스로 보완');
-    return [];
+    Logger.log('[EU EUR-Lex] HTTP ' + resp.getResponseCode() + ' (' + label + ')');
+    return null;
   }
-
-  var bindings;
-  try { bindings = JSON.parse(resp.getContentText()).results.bindings; }
+  try { return JSON.parse(resp.getContentText()).results.bindings || []; }
   catch (e) {
-    Logger.log('[EU EUR-Lex] 파싱 오류 — 응답 앞부분: ' + resp.getContentText().substring(0, 200));
-    return [];
+    Logger.log('[EU EUR-Lex] 파싱 오류(' + label + ') — 응답 앞부분: ' + resp.getContentText().substring(0, 200));
+    return null;
   }
+}
+
+function _collectEuClassificationRegs(periodStart) {
+  // 성능 원칙: CONTAINS(제목) 필터는 전체 DB 풀스캔을 유발하므로(실측 2분+ 소요),
+  // 좁히는 조건(문서유형=시행규칙, 기간, 영어 표현)을 먼저 걸어 후보를 줄인 뒤 제목 필터를 적용한다.
+  var since = _fmtDate(periodStart);
+  var core =
+    '  ?work cdm:resource_legal_id_celex ?celex . ' +
+    '  ?work cdm:work_date_document ?date . ' +
+    '  FILTER(?date >= "' + since + '"^^xsd:date) ' +
+    '  ?exp cdm:expression_belongs_to_work ?work . ' +
+    '  ?exp cdm:expression_uses_language <http://publications.europa.eu/resource/authority/language/ENG> . ' +
+    '  ?exp cdm:expression_title ?title . ' +
+    '  FILTER(CONTAINS(LCASE(STR(?title)), "classification of certain goods")) ';
+  var prefix =
+    'PREFIX cdm: <http://publications.europa.eu/ontology/cdm#> ' +
+    'PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> ' +
+    'SELECT DISTINCT ?celex ?title ?date WHERE { ';
+  var tail = '} ORDER BY DESC(?date) LIMIT ' + EURLEX_MAX;
+
+  // 1차: 문서유형을 시행규칙(REG_IMPL)으로 한정한 빠른 쿼리
+  var bindings = _eurlexQuery(
+    prefix +
+    '  ?work cdm:work_has_resource-type <http://publications.europa.eu/resource/authority/resource-type/REG_IMPL> . ' +
+    core + tail, '1차/REG_IMPL');
+
+  // 2차 폴백: 문서유형 한정 없이 (기간·영어 필터는 유지 — 풀스캔 아님)
   if (!bindings || !bindings.length) {
-    Logger.log('[EU EUR-Lex][진단] 결과 0건 — 응답 앞부분: ' + resp.getContentText().substring(0, 300) +
-               ' (술어명(cdm) 변동 가능성 — testEuEurlex() 실행 후 확인)');
+    Logger.log('[EU EUR-Lex] 1차 0건 — 문서유형 한정 없이 재시도');
+    bindings = _eurlexQuery(prefix + core + tail, '2차/광역');
+  }
+  if (!bindings) return [];
+  if (!bindings.length) {
+    Logger.log('[EU EUR-Lex][진단] 기간 내 결과 0건 — 실제로 신규 분류규칙이 없거나 술어명(cdm) 변동. ' +
+               'testEuEurlex() 실행으로 확인 가능');
     return [];
   }
 
@@ -2689,7 +2718,7 @@ function listAvailableModels() {
  */
 function testCbpApi() {
   var resp = UrlFetchApp.fetch(
-    'https://rulings.cbp.gov/api/search?term=smartphone&collection=ALL&sortBy=DATE_DESC&pageSize=3&page=1',
+    'https://rulings.cbp.gov/api/search?term=smartphone&collection=ALL&sortBy=DATE_DESC&pageSize=3&page=0',
     { method: 'get', muteHttpExceptions: true, headers: { 'Accept': 'application/json' } }
   );
   Logger.log('[testCbpApi] HTTP ' + resp.getResponseCode());
